@@ -198,6 +198,12 @@ pub struct GpuSynth {
     /// Voice ids of the last uploaded voice list, in upload order; used to
     /// map the read-back states onto the current (possibly shrunk) list.
     prev_voice_ids: Vec<u32>,
+    /// Reused per-block upload buffers (avoid re-allocating ~1.5 MB of
+    /// voice parameters every block when the pool sits at the cap).
+    upload_params: Vec<VoiceParams>,
+    upload_states: Vec<VoiceState>,
+    upload_env_stages: Vec<EnvStageGpu>,
+    upload_chans: Vec<u32>,
     /// Monotonic note-on counter; every zone voice of one note-on shares
     /// the current value as its `note_id`.
     note_counter: u64,
@@ -384,6 +390,10 @@ impl GpuSynth {
             last_out: None,
             last_states: None,
             prev_voice_ids: Vec::new(),
+            upload_params: Vec::new(),
+            upload_states: Vec::new(),
+            upload_env_stages: Vec::new(),
+            upload_chans: Vec::new(),
             note_counter: 0,
             voice_id_counter: 0,
             states_sync_counter: 0,
@@ -499,6 +509,27 @@ impl GpuSynth {
         });
     }
 
+    /// Loads a full sample-accurate event stream for realtime playback.
+    ///
+    /// The render thread consumes it internally (like the offline renderer)
+    /// by wall-clock-progressed `global_frame`, so the events never travel
+    /// through the per-event channel — the only way to keep up with dense
+    /// black-MIDI (hundreds of thousands of note events per second).
+    pub fn set_events(&mut self, events: Vec<TimedEvent>) {
+        self.offline_cursor = 0;
+        self.offline_events = events;
+    }
+
+    /// Returns true when the loaded event stream has been fully consumed and
+    /// no voice is still sounding (used by realtime playback to end the
+    /// render thread on its own).
+    pub fn stream_exhausted(&self) -> bool {
+        if self.offline_cursor < self.offline_events.len() {
+            return false;
+        }
+        self.voices.is_empty()
+    }
+
     /// Convenience: sends a note-on.
     pub fn note_on(&mut self, channel: u8, key: u8, vel: u8) {
         self.send_event(channel, MidiEvent::NoteOn { key, vel });
@@ -609,6 +640,81 @@ impl GpuSynth {
         self.render_midi_inner(midi_path, None)
     }
 
+    /// Forces one full GPU render pass (upload + dispatch + readback) so the
+    /// driver compiles the pipelines and the first *real* block does not pay
+    /// a hundreds-of-milliseconds cold-start stall (which empties the audio
+    /// queue and causes crackle on dense MIDI).
+    ///
+    /// Safe to call before any notes are played; it renders a silent block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SynthError::Gpu`] on GPU failures.
+    pub fn warm_gpu(&mut self) -> Result<(), SynthError> {
+        // A single voice with amp 0 renders silently but exercises the full
+        // pipeline (upload, dispatch, readback). Save/restore the global
+        // frame so the warm-up does not advance the timeline.
+        if self.sf.is_none() {
+            return Ok(());
+        }
+        let saved_frame = self.global_frame;
+        let saved_voices = std::mem::take(&mut self.voices);
+        self.key_voices.clear();
+
+        // Borrow sf to build one minimal voice.
+        let mut buf = vec![0.0f32; self.config.block_size * self.output_channels()];
+        if let Some(sf) = self.sf.as_ref() {
+            let zone_ids = sf.zones_at(60, 100);
+            if let Some(&zid) = zone_ids.first() {
+                if let Some(mut v) = build_voice(
+                    sf,
+                    zid,
+                    60,
+                    100,
+                    0,
+                    0,
+                    self.config.sample_rate,
+                    1.0,
+                    None,
+                    None,
+                    self.config.envelope_curves,
+                ) {
+                    v.amp = 0.0; // silent
+                    v.id = self.voice_id_counter;
+                    self.voice_id_counter += 1;
+                    self.voices.push(v);
+                }
+            }
+        }
+        if self.voices.is_empty() {
+            // No soundfont/zone; nothing to warm. Restore and return.
+            self.global_frame = saved_frame;
+            return Ok(());
+        }
+
+        self.upload_voices(0)?;
+        self.upload_new_samples()?;
+        self.update_mix_params(0)?;
+        self.dispatch(0)?;
+        let _ = self.readback(&mut buf);
+
+        // Restore state: drop the warm-up voice and reset the timeline.
+        self.voices = saved_voices;
+        self.key_voices.clear();
+        for (i, v) in self.voices.iter().enumerate() {
+            self.key_voices
+                .entry((v.channel, v.key))
+                .or_default()
+                .push_back(i);
+        }
+        self.global_frame = saved_frame;
+        self.active_voice_count = 0;
+        self.last_out = None;
+        self.last_states = None;
+        self.prev_voice_ids.clear();
+        Ok(())
+    }
+
     /// Pre-warms the GPU sample cache with every sample the MIDI file will
     /// use (resampled and uploaded up front).
     ///
@@ -667,6 +773,9 @@ impl GpuSynth {
                 self.render_bg_dirty = true;
             }
         }
+        // Warm the GPU pipelines so the first realtime block does not pay a
+        // multi-hundred-ms cold start (which would empty the audio queue).
+        self.warm_gpu()?;
         Ok(())
     }
 
@@ -1139,6 +1248,10 @@ impl GpuSynth {
     /// (retain-based removal changes all positions).
     fn rebuild_key_voices(&mut self) {
         self.key_voices.clear();
+        // Pre-size the map to the voice count so insertion never re-hashes.
+        // Rebuilt every block with a cap-sized pool (dense black-MIDI:
+        // ~8k voices), so this is a hot path.
+        self.key_voices.reserve(self.voices.len());
         for (i, v) in self.voices.iter().enumerate() {
             self.key_voices
                 .entry((v.channel, v.key))
@@ -1225,16 +1338,53 @@ impl GpuSynth {
         // Drop voices that ended (state refreshed by the previous readback)
         // and rebuild the per-key index before borrowing the GPU device.
         self.voices.retain(|v| v.state.ended == 0);
-        self.rebuild_key_voices();
+        // Global voice cap (once per block, not per note-on): `max_voices`
+        // is the GPU pool size; a pathological MIDI (black-MIDI note storms)
+        // would otherwise run the dispatch + upload far past the realtime
+        // budget. End the quietest note groups until we fit - cheap here
+        // because it runs once per block, not once per event.
+        if self.voices.len() > self.config.max_voices {
+            let over = self.voices.len() - self.config.max_voices;
+            // Group by note; end quietest first. O(n) grouping + partial sort
+            // on `over` elements keeps it fast even at the cap.
+            let mut by_note: Vec<(u8, u64)> = Vec::new();
+            for v in &self.voices {
+                match by_note.last_mut() {
+                    Some((_, note)) if *note == v.note_id => {}
+                    _ => by_note.push((v.vel, v.note_id)),
+                }
+            }
+            by_note.sort_by_key(|&(vel, _)| vel);
+            let mut freed = 0usize;
+            for (_, note) in by_note {
+                if freed >= over {
+                    break;
+                }
+                for v in &mut self.voices {
+                    if v.note_id == note && v.state.ended == 0 {
+                        v.state.ended = 1;
+                        freed += 1;
+                    }
+                }
+            }
+            self.voices.retain(|v| v.state.ended == 0);
+        }
 
+        self.rebuild_key_voices();
         let device = &self.res.ctx.device;
         let queue = &self.res.ctx.queue;
 
         let n = self.voices.len();
-        let mut params = vec![VoiceParams::zeroed(); n.max(1)];
-        let mut states = vec![VoiceState::zeroed(); n.max(1)];
-        let mut env_stages: Vec<EnvStageGpu> = Vec::new();
-        let mut voice_chans = vec![0u32; n.max(1)];
+        // Reuse the per-block upload buffers: `resize` keeps the allocation,
+        // so a cap-sized pool does not re-allocate ~1.5 MB every block.
+        self.upload_params.resize(n.max(1), VoiceParams::zeroed());
+        self.upload_states.resize(n.max(1), VoiceState::zeroed());
+        self.upload_env_stages.clear();
+        self.upload_chans.resize(n.max(1), 0);
+        let params = &mut self.upload_params;
+        let states = &mut self.upload_states;
+        let env_stages = &mut self.upload_env_stages;
+        let voice_chans = &mut self.upload_chans;
 
         // The states readback holds the GPU state at the end of the
         // *previous* block, which is exactly where this block must resume.
@@ -1246,19 +1396,27 @@ impl GpuSynth {
         // order; `retain` may have removed ended voices since then, so
         // index-aligned lookup would apply the wrong state to a surviving
         // voice (wrong int_time -> instant "ended" -> lost notes). Map by
-        // voice id instead.
+        // voice id.
+        //
+        // `prev_voice_ids` is monotonically increasing (voice ids are handed
+        // out by `voice_id_counter` and `retain` keeps order), so a binary
+        // search replaces the per-block HashMap build - a hot path when the
+        // voice pool sits at the cap (dense black-MIDI: ~8k voices).
+        let prev_ids = &self.prev_voice_ids;
         let resumed: std::collections::HashMap<u32, VoiceState> = self
             .last_states
             .as_ref()
             .map(|st| {
                 let count = st.len() / VoiceState::SIZE;
                 let mut by_id: std::collections::HashMap<u32, VoiceState> =
-                    std::collections::HashMap::with_capacity(count);
-                for (i, v) in self.prev_voice_ids.iter().enumerate() {
-                    if i < count {
-                        let off = i * VoiceState::SIZE;
+                    std::collections::HashMap::with_capacity(self.voices.len().min(count));
+                for v in self.voices.iter() {
+                    if let Ok(k) = prev_ids.binary_search(&v.id)
+                        && k < count
+                    {
+                        let off = k * VoiceState::SIZE;
                         let s: &VoiceState = bytemuck::from_bytes(&st[off..off + VoiceState::SIZE]);
-                        by_id.insert(*v, *s);
+                        by_id.insert(v.id, *s);
                     }
                 }
                 by_id
@@ -1729,50 +1887,65 @@ impl GpuSynth {
         let read_cur = cur;
         self.prev_submission = Some(idx.clone());
 
-        let out_slice = self.out_readback[read_cur].slice(..);
+        // Map reads: the callback only signals completion (it cannot unmap -
+        // `unmap` lives on `wgpu::Buffer`, not the slice). The buffer is
+        // unmapped right after the poll below, in ALL cases (success or the
+        // caller handling the returned Err). Never return Err between a map
+        // and its unmap, or the next block's copy to the same buffer hits
+        // wgpu's "Buffer is still mapped" validation error (a hard panic).
         let (otx, orx) = std::sync::mpsc::channel();
-        out_slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = otx.send(r.is_ok());
-        });
+        {
+            let rb: &wgpu::Buffer = &self.out_readback[read_cur];
+            rb.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = otx.send(r.is_ok());
+            });
+        }
         // The states map reads the copy made for THIS block, so its data is
         // ready only after the current submission completes (`wait` below).
         let states_map = if self.states_sync_counter == 0 {
-            let rb = self.states_readback[cur].buffer();
-            let s = rb.slice(..);
+            let rb: &wgpu::Buffer = self.states_readback[cur].buffer();
             let (stx, srx) = std::sync::mpsc::channel();
-            s.map_async(wgpu::MapMode::Read, move |r| {
+            rb.slice(..).map_async(wgpu::MapMode::Read, move |r| {
                 let _ = stx.send(r.is_ok());
             });
-            Some((s, srx))
+            Some((rb.clone(), srx))
         } else {
             None
         };
 
+        // Wait for the current submission. This is a correctness dependency,
+        // NOT an idle wait: the output of THIS block is the audio we must
+        // return, so the GPU has to finish it before we can read back. A
+        // timed-out poll here is fatal for realtime: it returns Err, leaves
+        // `out_readback[cur]` mapped and `out_readback_cur` unflipped, and
+        // the next block maps the same buffer again -> wgpu rejects it ->
+        // the render thread loops on errors forever with the GPU at 0%.
+        // (Observed on dense black-MIDI: GPU 0%, CPU 8%, playback frozen.)
         device
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(idx),
-                // Bounded wait: a wedged GPU must surface as an error instead
-                // of stalling the realtime render thread forever.
-                timeout: Some(std::time::Duration::from_millis(100)),
+                timeout: None,
             })
             .map_err(|e| SynthError::Gpu(format!("poll failed: {e:?}")))?;
 
-        if orx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .unwrap_or(false)
-        {
-            self.last_out = Some(out_slice.get_mapped_range().to_vec());
+        // Read back and unmap in every path: a buffer left mapped here makes
+        // the next block's copy to the same buffer fail wgpu validation
+        // ("Buffer is still mapped") - a hard panic in the render thread.
+        // The poll above has fired the map callbacks, so the receives below
+        // complete immediately.
+        let out_ok = orx.recv().unwrap_or(false);
+        if out_ok {
+            let slice = self.out_readback[read_cur].slice(..);
+            self.last_out = Some(slice.get_mapped_range().to_vec());
             self.out_readback[read_cur].unmap();
         } else {
             return Err(SynthError::Gpu("output readback map failed".into()));
         }
-        if let Some((s, srx)) = states_map {
-            if srx
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .unwrap_or(false)
-            {
-                self.last_states = Some(s.get_mapped_range().to_vec());
-                self.states_readback[cur].buffer().unmap();
+        if let Some((rb, srx)) = states_map {
+            let states_ok = srx.recv().unwrap_or(false);
+            if states_ok {
+                self.last_states = Some(rb.slice(..).get_mapped_range().to_vec());
+                rb.unmap();
             } else {
                 return Err(SynthError::Gpu("states readback map failed".into()));
             }
@@ -1792,7 +1965,6 @@ impl GpuSynth {
         };
         Ok(())
     }
-
     fn readback(&mut self, out: &mut [f32]) -> Result<(), SynthError> {
         let Some(data) = self.last_out.take() else {
             return Err(SynthError::Gpu("no output data".into()));

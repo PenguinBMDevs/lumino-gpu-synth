@@ -150,6 +150,7 @@ pub struct AudioPlayback {
     stop_flag: Arc<AtomicBool>,
     stop_tx: Option<mpsc::Sender<()>>,
     event_tx: Option<mpsc::Sender<(u8, MidiEvent)>>,
+    stream_tx: Option<mpsc::Sender<Vec<crate::midi::TimedEvent>>>,
     thread: Option<JoinHandle<()>>,
     sample_rate: u32,
     engine_rate: u32,
@@ -188,7 +189,8 @@ impl AudioPlayback {
 
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let (event_tx, event_rx) = mpsc::channel::<(u8, MidiEvent)>();
-        let (sample_tx, sample_rx) = mpsc::sync_channel::<Vec<f32>>(16);
+        let (stream_tx, stream_rx) = mpsc::channel::<Vec<crate::midi::TimedEvent>>();
+        let (sample_tx, sample_rx) = mpsc::sync_channel::<Vec<f32>>(32);
         let stop_flag = Arc::new(AtomicBool::new(false));
 
         // Stats shared between the callback, the render thread and the caller.
@@ -238,9 +240,14 @@ impl AudioPlayback {
                             next_pos += n;
                         }
                     }
+                    // Only count samples actually consumed from the queue
+                    // (`i`); an underrun wrote silence for the rest and must
+                    // not debit the buffer counter (that would make the
+                    // render thread see a fake, ever-growing debt and pace
+                    // itself wrong).
                     cb_stats
                         .samples
-                        .fetch_sub(data.len() as i64, Ordering::SeqCst);
+                        .fetch_sub(i as i64, Ordering::SeqCst);
                     cb_stats
                         .last_samples_after_read
                         .store(cb_stats.samples.load(Ordering::SeqCst), Ordering::Relaxed);
@@ -266,14 +273,26 @@ impl AudioPlayback {
                 let mut synth = synth;
                 let mut buf = vec![0.0f32; block * channels];
                 let mut resampler = LinearResampler::new(engine_rate, device_rate, channels);
+                let mut last_err = false;
                 // Max allowed render time per block: 90% of realtime so the
-                // thread stays slightly ahead and can absorb slow blocks.
-                // NOTE: based on `block` (one frame, all channels) — using
-                // `block * channels` would double the budget and starve the
-                // consumer (underruns / crackle).
+                // thread runs slightly ahead and the queue accumulates a
+                // cushion that absorbs peak blocks (dense black-MIDI). The
+                // queue's `try_send` wait throttles when we run too far
+                // ahead. NOTE: based on `block` (one frame, all channels) —
+                // using `block * channels` would double the budget.
                 let delay = Duration::from_secs_f64(block as f64 / engine_rate.max(1) as f64 * 0.9);
 
+                // If a full event stream is supplied, the engine consumes it
+                // internally by `global_frame` (no per-event channel traffic)
+                // - the only way to keep up with dense black-MIDI.
+                let mut has_stream = false;
+
                 loop {
+                    // Accept an event stream (usually once, at startup).
+                    if let Ok(events) = stream_rx.try_recv() {
+                        synth.set_events(events);
+                        has_stream = true;
+                    }
                     // Drain pending MIDI events (non-blocking).
                     while let Ok((ch, ev)) = event_rx.try_recv() {
                         synth.send_event(ch, ev);
@@ -282,26 +301,40 @@ impl AudioPlayback {
                         break;
                     }
 
-                    // Backpressure: if we are more than 10% ahead of the
-                    // last request, wait for the consumer to catch up.
-                    loop {
-                        let samples = thread_stats.samples.load(Ordering::SeqCst);
-                        let requested = thread_stats.last_request_samples.load(Ordering::SeqCst);
-                        if samples > requested * 110 / 100 {
-                            std::thread::sleep(delay / 10);
-                            if thread_stop.load(Ordering::Relaxed) || stop_rx.try_recv().is_ok() {
-                                return;
-                            }
-                        } else {
+                    // When a full stream is loaded, stop the render thread
+                    // once the stream is exhausted (plus a decay tail) so the
+                    // playback ends on its own instead of idling forever.
+                    if has_stream {
+                        let done = synth.stream_exhausted();
+                        if done {
                             break;
                         }
                     }
 
+                    // No explicit backpressure loop here: the bounded queue
+                    // itself is the throttle. The cadence sleep below paces
+                    // rendering at 90% of realtime (so we stay slightly
+                    // ahead), and when the queue fills the `try_send` wait
+                    // below naturally slows us to the consumer's pace. An
+                    // explicit "samples > requested * k" check would compare
+                    // one block (~8k samples) against a single callback
+                    // request (~1k samples) and sleep after every block,
+                    // keeping the queue nearly empty - the cause of the
+                    // periodic underruns.
+
                     let start = Instant::now();
-                    if synth.render_block(&mut buf).is_err() {
+                    if let Err(e) = synth.render_block(&mut buf) {
+                        // Never die silently: a wedged GPU surfaces here every
+                        // block; print it once so the freeze is diagnosable
+                        // instead of looking like a hung process.
+                        if !last_err {
+                            eprintln!("[render] block error: {e}");
+                            last_err = true;
+                        }
                         std::thread::sleep(delay / 10);
                         continue;
                     }
+                    last_err = false;
                     thread_stats
                         .voice_count
                         .store(synth.voice_count() as u64, Ordering::Relaxed);
@@ -331,11 +364,15 @@ impl AudioPlayback {
                     let total = delay.as_secs_f64();
                     thread_stats.push_render_load(elapsed / total);
 
-                    // Sleep until the next cadence point so we render at
-                    // ~90% of realtime and stay slightly ahead.
+                    // Sleep until the next cadence point (90% of realtime) to
+                    // play in real time - UNLESS the queue is below the
+                    // target cushion (about two blocks buffered): then render
+                    // back-to-back to refill it so peak blocks never starve
+                    // the audio callback.
                     let now = Instant::now();
                     let end = start + delay;
-                    if end > now {
+                    let cushion = (block * channels * 2) as i64;
+                    if thread_stats.samples.load(Ordering::SeqCst) >= cushion && end > now {
                         std::thread::sleep(end - now);
                     }
                 }
@@ -346,12 +383,26 @@ impl AudioPlayback {
             stop_flag,
             stop_tx: Some(stop_tx),
             event_tx: Some(event_tx),
+            stream_tx: Some(stream_tx),
             thread: Some(thread),
             sample_rate: device_rate,
             engine_rate,
             stats,
             _stream: Some(stream),
         })
+    }
+
+    /// Plays a full, sample-accurate event stream (from
+    /// [`MidiFile::load`]) in real time.
+    ///
+    /// The events are consumed internally by the render thread's block
+    /// progression, so this scales to dense black-MIDI (millions of note
+    /// events) without per-event channel traffic. The render thread ends by
+    /// itself once the stream is exhausted and the voices decay.
+    pub fn play_events(&mut self, events: Vec<crate::midi::TimedEvent>) {
+        if let Some(tx) = &self.stream_tx {
+            let _ = tx.send(events);
+        }
     }
 
     /// Returns a snapshot reader of the playback statistics.
@@ -453,6 +504,11 @@ impl AudioPlayback {
         self.engine_rate
     }
 
+    /// Returns true while the render thread is still alive (playing).
+    pub fn thread_running(&self) -> bool {
+        self.thread.is_some()
+    }
+
     /// Stops the render thread (and closes the audio stream).
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
@@ -463,6 +519,7 @@ impl AudioPlayback {
             let _ = h.join();
         }
         self.event_tx = None;
+        self.stream_tx = None;
         self._stream = None;
     }
 }

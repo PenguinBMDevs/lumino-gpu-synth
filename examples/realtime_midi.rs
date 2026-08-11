@@ -43,7 +43,14 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let sample_rate = 48_000;
     let config = SynthConfig {
         sample_rate,
-        block_size: 2048,
+        // 4096-frame blocks balance the GPU's ~10ms fixed submit cost against
+        // per-frame voice work.
+        block_size: 4096,
+        // Cap the voice pool tight: the GPU is the throughput limit on this
+        // machine (submit ~10ms/block even for a handful of voices), and
+        // each thousand voices adds GPU dispatch time. 2048 voices is plenty
+        // for dense black-MIDI peaks (~5.5k notes get stolen down to fit).
+        max_voices: 2048,
         show_progress: false,
         ..SynthConfig::default()
     };
@@ -108,55 +115,39 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
         }
     });
 
-    // Realtime scheduler: send events whose sample time has been reached,
-    // paced by a wall clock so the audio runs in real time.
-    let stop_at = if max_seconds > 0.0 {
-        Some(max_seconds * engine_rate as f64)
-    } else {
-        None
-    };
-    let t0 = Instant::now();
-    let mut cursor = 0usize;
-    let mut sent = 0u64;
-    while cursor < events.len() {
-        let elapsed = t0.elapsed().as_secs_f64();
-        let elapsed_frames = elapsed * engine_rate as f64;
-        if let Some(limit) = stop_at
-            && elapsed_frames > limit
-        {
-            break;
-        }
-        while cursor < events.len() {
-            let ev = events[cursor];
-            if (ev.sample as f64) > elapsed_frames {
+    // Load the whole event stream into the engine: it is consumed internally
+    // by block progression, so dense black-MIDI (millions of events) never
+    // travels through the per-event channel. The render thread ends by
+    // itself when the stream is exhausted and the voices decay.
+    playback.play_events(events);
+    if max_seconds > 0.0 {
+        // Stop after `max_seconds` of playback: join the render thread with
+        // a generous timeout (GPU renders are paced ~realtime).
+        let wait = Duration::from_secs_f64(max_seconds + 5.0);
+        let t0 = Instant::now();
+        while t0.elapsed() < wait {
+            std::thread::sleep(Duration::from_millis(100));
+            if !playback.thread_running() {
                 break;
             }
-            playback.send_event(ev.channel, ev.event);
-            sent += 1;
-            cursor += 1;
         }
-        std::thread::sleep(Duration::from_millis(2));
+        println!("\nstopped after {max_seconds}s");
+    } else {
+        // Natural end: wait for the render thread to finish the stream.
+        while playback.thread_running() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        println!("\nplayback finished");
     }
 
     running.store(false, Ordering::Relaxed);
     let _ = stats_thread.join();
-    println!();
-
-    match stop_at {
-        Some(_) => println!("stopped after {max_seconds}s: {sent} events sent"),
-        None => println!("playback finished: {sent} events sent"),
-    }
     let final_stats = playback.stats();
     println!(
         "final stats: avg render load {:.2}, total underruns {}",
         final_stats.average_renderer_load(),
         final_stats.underruns()
     );
-    // Release every channel's notes, then let the tails decay.
-    for ch in 0..16 {
-        playback.all_notes_off(ch);
-    }
-    std::thread::sleep(Duration::from_millis(600));
     playback.stop();
     Ok(())
 }
