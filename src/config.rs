@@ -115,6 +115,14 @@ pub struct SynthConfig {
     ///
     /// Default: `120.0` seconds.
     pub max_tail_seconds: f32,
+
+    /// Whether offline rendering prints a progress bar to stderr.
+    ///
+    /// Used by the render examples so long exports are visibly alive; the
+    /// bar is a single `\r`-rewritten line, so it never floods the log.
+    ///
+    /// Default: `false` (library callers stay quiet).
+    pub show_progress: bool,
 }
 
 impl Default for SynthConfig {
@@ -130,6 +138,7 @@ impl Default for SynthConfig {
             channels: ChannelMode::Stereo,
             render_silence_threshold: 0.0001,
             max_tail_seconds: 120.0,
+            show_progress: false,
         }
     }
 }

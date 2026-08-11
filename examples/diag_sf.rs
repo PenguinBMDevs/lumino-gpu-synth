@@ -28,6 +28,10 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
                     "    sample_id={} native_rate={} loop={:?} cutoff={:?}",
                     z.sample_id, z.native_rate, z.loop_mode, z.cutoff
                 );
+                println!(
+                    "    volume={:.6} pan={:.4} speed_mult={:.6} offset={} sample_end={}",
+                    z.volume, z.pan, z.speed_mult, z.offset, z.sample_end
+                );
             }
         }
     }

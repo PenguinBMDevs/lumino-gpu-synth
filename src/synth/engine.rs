@@ -201,6 +201,11 @@ pub struct GpuSynth {
     /// Monotonic note-on counter; every zone voice of one note-on shares
     /// the current value as its `note_id`.
     note_counter: u64,
+    /// Monotonic voice id counter. Voice ids must be unique for the lifetime
+    /// of the engine: `upload_voices` maps read-back GPU states back to
+    /// voices by id, and reusing ids (e.g. the array position) would apply a
+    /// stale state to the wrong voice and roll its envelope back.
+    voice_id_counter: u32,
     /// Voice states are only read back every `STATES_SYNC_EVERY` blocks:
     /// a voice ending late does not change any audio sample, and skipping
     /// the extra map/poll round trip per block is a large CPU win.
@@ -380,6 +385,7 @@ impl GpuSynth {
             last_states: None,
             prev_voice_ids: Vec::new(),
             note_counter: 0,
+            voice_id_counter: 0,
             states_sync_counter: 0,
             prev_submission: None,
         };
@@ -449,6 +455,30 @@ impl GpuSynth {
             v.release_at,
             v.start_at,
         ))
+    }
+
+    /// Diagnostics: per-voice `(key, vel, speed, amp, released, ended,
+    /// env_stage, env_t, release_at, gpu_is_released, env_from)`.
+    #[doc(hidden)]
+    pub fn debug_voices(&self) -> Vec<(u8, u8, f32, f32, bool, bool, u32, u32, u64, u32, f32)> {
+        self.voices
+            .iter()
+            .map(|v| {
+                (
+                    v.key,
+                    v.vel,
+                    v.speed,
+                    v.amp,
+                    v.released || v.release_at != u64::MAX,
+                    v.state.ended != 0,
+                    v.state.env_stage,
+                    v.state.env_t,
+                    v.release_at,
+                    v.state.is_released,
+                    v.state.env_from,
+                )
+            })
+            .collect()
     }
 
     /// The number of frames rendered so far.
@@ -576,6 +606,29 @@ impl GpuSynth {
         &mut self,
         midi_path: impl AsRef<std::path::Path>,
     ) -> Result<RenderResult, SynthError> {
+        self.render_midi_inner(midi_path, None)
+    }
+
+    /// Renders the first `frames` frames of a MIDI file (used to compare the
+    /// beginning of long MIDIs without rendering the whole piece).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SynthError::Midi`] if the file cannot be parsed, or
+    /// [`SynthError::Gpu`] on GPU failures.
+    pub fn render_midi_frames(
+        &mut self,
+        midi_path: impl AsRef<std::path::Path>,
+        frames: u64,
+    ) -> Result<RenderResult, SynthError> {
+        self.render_midi_inner(midi_path, Some(frames))
+    }
+
+    fn render_midi_inner(
+        &mut self,
+        midi_path: impl AsRef<std::path::Path>,
+        limit_frames: Option<u64>,
+    ) -> Result<RenderResult, SynthError> {
         self.offline_cursor = 0;
         self.offline_events = Vec::new();
         self.voices.clear();
@@ -645,15 +698,24 @@ impl GpuSynth {
         let events_end = self.offline_events.last().map_or(0, |e| e.sample);
         let tail_budget =
             (self.config.max_tail_seconds as f64 * self.config.sample_rate as f64) as u64;
-        let max_frames = events_end
-            .saturating_add(tail_budget)
-            .min(MAX_RENDER_FRAMES);
+        let max_frames = match limit_frames {
+            Some(n) => n.min(MAX_RENDER_FRAMES),
+            None => events_end
+                .saturating_add(tail_budget)
+                .min(MAX_RENDER_FRAMES),
+        };
+        let limited = limit_frames.is_some();
 
         let block = self.config.block_size;
         let chs = self.output_channels();
         let threshold = self.config.render_silence_threshold;
         let mut samples: Vec<f32> = Vec::new();
         let mut block_buf = vec![0.0f32; block * chs];
+
+        // Progress reporting: the total is the render horizon (`max_frames`).
+        // Phase 1 walks the event stream; the tail phase renders past the
+        // last event, so the bar is allowed to exceed 100% there.
+        let mut progress = ProgressBar::new(max_frames, self.config.show_progress);
 
         // Phase 1: process all events and render until no voices remain. If
         // the events are exhausted and the block went silent, we stop even
@@ -662,14 +724,32 @@ impl GpuSynth {
         loop {
             let events_done = self.offline_cursor >= self.offline_events.len();
             if events_done && self.voices.is_empty() {
+                if prof {
+                    eprintln!(
+                        "[render] break: events_done+empty at frame {}",
+                        self.global_frame
+                    );
+                }
                 break;
             }
             self.render_block(&mut block_buf)?;
+            progress.tick(self.global_frame);
             let silent = block_buf.iter().all(|s| s.abs() <= threshold);
             if events_done && silent {
+                if prof {
+                    eprintln!(
+                        "[render] break: events_done+silent at frame {} cursor={}/{}",
+                        self.global_frame,
+                        self.offline_cursor,
+                        self.offline_events.len()
+                    );
+                }
                 break;
             }
             if self.global_frame >= max_frames {
+                if limited {
+                    break;
+                }
                 return Err(self.render_timeout(&block_buf));
             }
             samples.extend_from_slice(&block_buf);
@@ -678,8 +758,9 @@ impl GpuSynth {
         // Phase 2: decay tail - render blocks until one is entirely silent.
         loop {
             self.render_block(&mut block_buf)?;
+            progress.tick(self.global_frame);
             let silent = block_buf.iter().all(|s| s.abs() <= threshold);
-            if silent {
+            if silent || (limited && self.global_frame >= max_frames) {
                 break;
             }
             if self.global_frame >= max_frames {
@@ -695,6 +776,7 @@ impl GpuSynth {
         if block_buf.iter().any(|s| s.abs() > threshold) {
             samples.extend_from_slice(&block_buf);
         }
+        progress.finish();
 
         if prof {
             let t2 = std::time::Instant::now();
@@ -854,11 +936,16 @@ impl GpuSynth {
         }
         let zone_count = zone_ids.len();
         let pitch_mult = self.channels[ch].pitch_multiplier;
-        self.note_counter += 1;
-        let note_id = self.note_counter;
 
+        // Build every zone voice of this note up front so that polyphony
+        // management (exclusive class + per-key stealing) runs *once per
+        // note* instead of once per zone. The old code ran the steal logic
+        // inside the zone loop, so the second zone of a stereo pair could
+        // steal the first zone's voice pushed milliseconds earlier - the
+        // cause of dropped notes on dense repeated single keys.
+        let mut built: Vec<Voice> = Vec::with_capacity(zone_count);
         for zone_id in zone_ids {
-            let voice = build_voice(
+            if let Some(v) = build_voice(
                 sf,
                 zone_id,
                 key,
@@ -870,97 +957,112 @@ impl GpuSynth {
                 self.channels[ch].env_attack,
                 self.channels[ch].env_release,
                 self.config.envelope_curves,
-            );
-            let Some(mut voice) = voice else { continue };
+            ) {
+                built.push(v);
+            }
+        }
+        if built.is_empty() {
+            return Ok(());
+        }
 
-            // Exclusive class: kill previous voices with the same class and
-            // rebuild the per-key index (field-level, `sf` is still borrowed).
-            if let Some(class) = voice.exclusive_class {
-                self.voices.retain(|v| v.exclusive_class != Some(class));
-                self.key_voices.clear();
-                for (i, v) in self.voices.iter().enumerate() {
-                    self.key_voices
-                        .entry((v.channel, v.key))
-                        .or_default()
-                        .push_back(i);
+        self.note_counter += 1;
+        let note_id = self.note_counter;
+
+        // Exclusive class: kill previous voices with the same class and
+        // rebuild the per-key index. One class check per note (the zones of
+        // a note share their class).
+        if let Some(class) = built.iter().find_map(|v| v.exclusive_class) {
+            self.voices.retain(|v| v.exclusive_class != Some(class));
+            self.rebuild_key_voices();
+        }
+
+        // XSynth-style per-key polyphony limit: a new note-on may only
+        // steal from the voices of the *same key* on this channel, keeping
+        // at most `max_voices_per_key` layers per key (counting all zones).
+        // There is no global voice cap - dense MIDI never drops unrelated
+        // notes.
+        //
+        // Mirror XSynth's `pop_quietest_voice_group`: steal the *quietest*
+        // voices of the key (smallest velocity), not the oldest. Killing a
+        // barely-audible layer produces no audible click and preserves the
+        // loud melodic line, so repeated notes sound like XSynth instead of
+        // a chopped, clicky mess.
+        //
+        // XSynth steals whole note *groups* (all zones spawned by one
+        // note-on), so a stereo pair is never split. We do the same: voices
+        // of one note share `note_id` and are killed together.
+        //
+        // The stolen voices end *immediately* (no release tail): the layer
+        // limit counts voices of the key, so a repeated note replaces its
+        // own predecessors instead of stacking inaudible release tails.
+        // This keeps the voice pool bounded by `keys x max_voices_per_key`
+        // even for pathological note densities.
+        //
+        // Voices already marked `ended` (killed by a previous steal, still
+        // in the array until the next block upload) occupy a slot without
+        // any audible content - they are released for free first, so the
+        // quota only counts voices that can actually be heard.
+        let limit = self.config.max_voices_per_key;
+        if limit > 0 {
+            let mut kept: VecDeque<usize> = VecDeque::new();
+            let mut killed = 0usize;
+            if let Some(positions) = self.key_voices.get(&(ch as u8, key)) {
+                // Group consecutive same-note voices (spawn order keeps one
+                // note's zones adjacent); ended voices are freed first.
+                let mut groups: Vec<(u8, Vec<usize>)> = Vec::new();
+                let mut stale: Vec<usize> = Vec::new();
+                for &pos in positions {
+                    let Some(v) = self.voices.get(pos) else {
+                        continue;
+                    };
+                    if v.state.ended != 0 {
+                        stale.push(pos);
+                        continue;
+                    }
+                    let (vel, note) = (v.vel, v.note_id);
+                    match groups.last_mut() {
+                        Some((_, g)) if self.voices[g[0]].note_id == note => g.push(pos),
+                        _ => groups.push((vel, vec![pos])),
+                    }
+                }
+                // Free already-ended voices for free, then kill whole
+                // quietest groups until the new note (zone_count voices)
+                // keeps the key at or under `limit`.
+                let active = groups.iter().map(|(_, g)| g.len()).sum::<usize>();
+                let need_free = active.saturating_sub(limit.saturating_sub(zone_count));
+                groups.sort_by_key(|&(vel, _)| vel);
+                let mut freed = 0usize;
+                let mut kill_groups = 0usize;
+                for (_, g) in &groups {
+                    if freed >= need_free {
+                        break;
+                    }
+                    freed += g.len();
+                    kill_groups += 1;
+                }
+                let mut kill_set: Vec<usize> = Vec::new();
+                for (_, g) in groups.iter().take(kill_groups) {
+                    kill_set.extend(g.iter().copied());
+                }
+                for &pos in positions {
+                    if kill_set.contains(&pos) || stale.contains(&pos) {
+                        if let Some(v) = self.voices.get_mut(pos) {
+                            v.state.ended = 1;
+                            killed += 1;
+                        }
+                    } else {
+                        kept.push_back(pos);
+                    }
                 }
             }
-
-            // XSynth-style per-key polyphony limit: a new note-on may only
-            // steal from the voices of the *same key* on this channel,
-            // keeping at most `max_voices_per_key` layers per key (counting
-            // all zones). There is no global voice cap - dense MIDI never
-            // drops unrelated notes.
-            //
-            // Mirror XSynth's `pop_quietest_voice_group`: steal the
-            // *quietest* voices of the key (smallest velocity), not the
-            // oldest. Killing a barely-audible layer produces no audible
-            // click and preserves the loud melodic line, so repeated notes
-            // sound like XSynth instead of a chopped, clicky mess.
-            //
-            // XSynth steals whole note *groups* (all zones spawned by one
-            // note-on), so a stereo pair is never split. We do the same:
-            // voices of one note share `note_id` and are killed together.
-            //
-            // The stolen voices end *immediately* (no release tail): the
-            // layer limit counts voices of the key, so a repeated note
-            // replaces its own predecessors instead of stacking inaudible
-            // release tails. This keeps the voice pool bounded by
-            // `keys x max_voices_per_key` even for pathological note
-            // densities.
-            let limit = self.config.max_voices_per_key;
-            if limit > 0 {
-                let mut kept: VecDeque<usize> = VecDeque::new();
-                let mut killed = 0usize;
-                if let Some(positions) = self.key_voices.get(&(ch as u8, key)) {
-                    // Group consecutive same-note voices (spawn order keeps
-                    // one note's zones adjacent).
-                    let mut groups: Vec<(u8, Vec<usize>)> = Vec::new();
-                    for &pos in positions {
-                        let (vel, note) = match self.voices.get(pos) {
-                            Some(v) => (v.vel, v.note_id),
-                            None => continue,
-                        };
-                        match groups.last_mut() {
-                            Some((_, g)) if self.voices[g[0]].note_id == note => g.push(pos),
-                            _ => groups.push((vel, vec![pos])),
-                        }
-                    }
-                    // Kill whole quietest groups until the new note fits.
-                    let need_free = positions
-                        .len()
-                        .saturating_sub(limit.saturating_sub(zone_count));
-                    groups.sort_by_key(|&(vel, _)| vel);
-                    let mut freed = 0usize;
-                    let mut kill_groups = 0usize;
-                    for (_, g) in &groups {
-                        if freed >= need_free {
-                            break;
-                        }
-                        freed += g.len();
-                        kill_groups += 1;
-                    }
-                    let mut kill_set: Vec<usize> = Vec::new();
-                    for (_, g) in groups.iter().take(kill_groups) {
-                        kill_set.extend(g.iter().copied());
-                    }
-                    for &pos in positions {
-                        if kill_set.contains(&pos) {
-                            if let Some(v) = self.voices.get_mut(pos) {
-                                v.state.ended = 1;
-                                killed += 1;
-                            }
-                        } else {
-                            kept.push_back(pos);
-                        }
-                    }
-                }
-                if killed > 0 {
-                    self.key_voices.insert((ch as u8, key), kept);
-                }
+            if killed > 0 {
+                self.key_voices.insert((ch as u8, key), kept);
             }
+        }
 
-            voice.id = self.voices.len() as u32;
+        for mut voice in built {
+            voice.id = self.voice_id_counter;
+            self.voice_id_counter += 1;
             voice.note_id = note_id;
             let pos = self.voices.len();
             self.voices.push(voice);
@@ -1142,7 +1244,12 @@ impl GpuSynth {
             } else {
                 resumed.get(&v.id).copied().unwrap_or(v.state)
             };
-            voice_chans[i] = v.channel as u32;
+            voice_chans[i] = v.channel as u32
+                | ((if v.released || v.release_at != u64::MAX {
+                    1u32
+                } else {
+                    0u32
+                }) << 7);
         }
 
         if self
@@ -1325,6 +1432,13 @@ impl GpuSynth {
                 .try_into()
                 .map_err(|_| SynthError::Gpu("channel count mismatch".into()))?,
         };
+        if std::env::var("LUMINO_VOICEDUMP").is_ok() && base > 415_000 && base < 420_000 {
+            let s = &self.channels[0];
+            eprintln!(
+                "[mix] base={base} ch0 vol={:.4} expr={:.4} pan={:.4}",
+                s.volume.current, s.expression.current, s.pan.current
+            );
+        }
         queue.write_buffer(&self.mix_params_buf, 0, bytemuck::cast_slice(&[params]));
         Ok(())
     }
@@ -1688,4 +1802,64 @@ fn write_samples(
         remaining = &remaining[take..];
     }
     Ok(grown)
+}
+
+/// A single-line `\r`-rewritten progress bar for offline rendering.
+///
+/// The bar shows the fraction of the render horizon that is complete. It is
+/// a no-op when disabled (library callers), and rewrites one line on stderr
+/// so long exports stay visibly alive without flooding the log.
+struct ProgressBar {
+    /// Total frame count the bar is measured against.
+    total: u64,
+    /// Progress bar width in characters.
+    width: usize,
+    /// Last reported percent, so the bar only repaints when it changes.
+    last_pct: i32,
+    /// Whether output is enabled at all.
+    enabled: bool,
+}
+
+impl ProgressBar {
+    fn new(total: u64, enabled: bool) -> Self {
+        Self {
+            total: total.max(1),
+            width: 24,
+            last_pct: -1,
+            enabled,
+        }
+    }
+
+    /// Advances the bar to `done` frames and repaints when the percent
+    /// crossed a whole-number boundary.
+    fn tick(&mut self, done: u64) {
+        if !self.enabled {
+            return;
+        }
+        let pct = ((done as f64 / self.total as f64) * 100.0) as i32;
+        if pct <= self.last_pct {
+            return;
+        }
+        self.last_pct = pct;
+        self.paint(pct);
+    }
+
+    /// Ends the bar on its own line (100% or the last painted value).
+    fn finish(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.last_pct = 100;
+        self.paint(100);
+        eprintln!();
+    }
+
+    fn paint(&self, pct: i32) {
+        let pct = pct.clamp(0, 100);
+        let filled = (pct as usize * self.width) / 100;
+        let bar: String = std::iter::repeat_n('=', filled)
+            .chain(std::iter::repeat_n(' ', self.width - filled))
+            .collect();
+        eprint!("\r[render] [{}] {pct:3}%", bar);
+    }
 }

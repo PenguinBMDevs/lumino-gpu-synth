@@ -2,7 +2,10 @@
 use lumino_gpu_synth::MidiFile;
 
 fn main() -> Result<(), lumino_gpu_synth::SynthError> {
-    let midi = MidiFile::load("assets/right-example.mid", 64_000)?;
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "assets/right-example.mid".into());
+    let midi = MidiFile::load(&path, 64_000)?;
     println!(
         "events: {}, length_ticks: {}, duration: {:.3}s",
         midi.sequence.events.len(),
@@ -10,7 +13,7 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
         midi.duration_secs()
     );
     // Derive ppq directly from the raw file.
-    let raw = std::fs::read("assets/right-example.mid")?;
+    let raw = std::fs::read(&path)?;
     let smf = lumino_midly::Smf::parse(&raw).expect("parse");
     if let lumino_midly::Timing::Metrical(ppq) = smf.header.timing {
         println!("ppq: {}", ppq.as_int());

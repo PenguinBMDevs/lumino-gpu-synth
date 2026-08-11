@@ -9,11 +9,13 @@
 use lumino_gpu_synth::audio::wav::read_wav;
 use lumino_gpu_synth::compare::{compare, format_report};
 use lumino_gpu_synth::{GpuSynth, SynthConfig};
-
 fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "--gen" {
         // Write single-note.mid via lumino-midly (correct varlen encoding).
+        let key: u8 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(60);
+        let vel: u8 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(100);
+        let off_tick: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(5984);
         use lumino_midly::num::u28;
         use lumino_midly::{
             Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind,
@@ -24,21 +26,18 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
                 TrackEvent {
                     delta: u28::new(0),
                     kind: TrackEventKind::Midi {
-                        channel: 3u8.into(),
+                        channel: 0u8.into(),
                         message: MidiMessage::NoteOn {
-                            key: 61u8,
-                            vel: 70.into(),
+                            key,
+                            vel: vel.into(),
                         },
                     },
                 },
                 TrackEvent {
-                    delta: u28::new(98),
+                    delta: u28::new(off_tick),
                     kind: TrackEventKind::Midi {
-                        channel: 3u8.into(),
-                        message: MidiMessage::NoteOff {
-                            key: 61u8,
-                            vel: 0.into(),
-                        },
+                        channel: 0u8.into(),
+                        message: MidiMessage::NoteOff { key, vel: 0.into() },
                     },
                 },
                 TrackEvent {
@@ -48,14 +47,19 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
             ]],
         };
         smf.save("single-note.mid").expect("save");
-        println!("wrote single-note.mid (note on tick 0, off tick 5984)");
+        println!("wrote single-note.mid (key={key} vel={vel} off_tick={off_tick})");
         return Ok(());
     }
 
     // Render our version.
     let config = SynthConfig {
-        use_effects: true,
+        use_effects: false,
         max_voices: 16384,
+        envelope_curves: lumino_gpu_synth::synth::dsp::EnvelopeCurveConfig {
+            attack_curve: lumino_gpu_synth::synth::dsp::CurveKind::Exponential,
+            decay_curve: lumino_gpu_synth::synth::dsp::CurveKind::Exponential,
+            release_curve: lumino_gpu_synth::synth::dsp::CurveKind::Exponential,
+        },
         ..SynthConfig::default()
     };
     let mut synth = GpuSynth::new(config)?;

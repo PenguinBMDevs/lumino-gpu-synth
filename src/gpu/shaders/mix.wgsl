@@ -78,19 +78,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Accumulate voices grouped by channel.
+    // Accumulate voices grouped by channel. Released voices are summed
+    // separately: XSynth's channel volume (CC7/CC11) does not affect the
+    // release tail (the reference renderer applies volume only to the active
+    // body), so released voices must skip the per-channel amp but still get
+    // the channel pan.
     var acc_l: array<f32, MAX_CHANNELS>;
     var acc_r: array<f32, MAX_CHANNELS>;
+    var acc_rel_l: array<f32, MAX_CHANNELS>;
+    var acc_rel_r: array<f32, MAX_CHANNELS>;
     for (var c = 0u; c < MAX_CHANNELS; c = c + 1u) {
         acc_l[c] = 0.0;
         acc_r[c] = 0.0;
+        acc_rel_l[c] = 0.0;
+        acc_rel_r[c] = 0.0;
     }
 
     for (var v = 0u; v < mix_params.voice_count; v = v + 1u) {
         let base = (v * mix_params.block_size + f) * 2u;
-        let ch = voice_chans[v] & (MAX_CHANNELS - 1u);
-        acc_l[ch] = acc_l[ch] + voice_out[base];
-        acc_r[ch] = acc_r[ch] + voice_out[base + 1u];
+        let vc = voice_chans[v];
+        let ch = vc & (MAX_CHANNELS - 1u);
+        let released = (vc >> 7u) & 1u;
+        if (released == 0u) {
+            acc_l[ch] = acc_l[ch] + voice_out[base];
+            acc_r[ch] = acc_r[ch] + voice_out[base + 1u];
+        } else {
+            acc_rel_l[ch] = acc_rel_l[ch] + voice_out[base];
+            acc_rel_r[ch] = acc_rel_r[ch] + voice_out[base + 1u];
+        }
     }
 
     // Per-channel lerp state machines, starting from the block-start state
@@ -144,8 +159,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let pan_l = cos(pan_angle);
         let pan_r = sin(pan_angle);
 
-        out_l = out_l + acc_l[ch] * amp * pan_l;
-        out_r = out_r + acc_r[ch] * amp * pan_r;
+        out_l = out_l + acc_l[ch] * amp * pan_l + acc_rel_l[ch] * pan_l;
+        out_r = out_r + acc_r[ch] * amp * pan_r + acc_rel_r[ch] * pan_r;
     }
 
     output[f * 2u] = out_l;

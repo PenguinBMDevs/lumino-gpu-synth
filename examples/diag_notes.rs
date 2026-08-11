@@ -8,7 +8,10 @@ use lumino_gpu_synth::MidiFile;
 use lumino_gpu_synth::midi::MidiEvent::*;
 
 fn main() -> Result<(), lumino_gpu_synth::SynthError> {
-    let midi = MidiFile::load("assets/right-example.mid", 64_000)?;
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "assets/right-example.mid".into());
+    let midi = MidiFile::load(&path, 64_000)?;
 
     // Pair note-ons/offs per (channel,key) with a FIFO queue so overlapping
     // notes of the same key do not corrupt the length histogram.
