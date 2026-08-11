@@ -3,8 +3,8 @@
 //!
 //! Usage: cargo run --release --example analyze_midi -- <midi file>
 
-use lumino_gpu_synth::midi::MidiEvent;
 use lumino_gpu_synth::MidiFile;
+use lumino_gpu_synth::midi::MidiEvent;
 
 fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let args: Vec<String> = std::env::args().collect();
@@ -16,7 +16,12 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let midi = MidiFile::load(&path, sr)?;
     let evs = &midi.sequence.events;
     let dur = evs.last().map_or(0.0, |e| e.sample as f64 / sr as f64);
-    println!("events: {}  duration: {:.2}s  ev/s: {:.0}", evs.len(), dur, evs.len() as f64 / dur.max(0.001));
+    println!(
+        "events: {}  duration: {:.2}s  ev/s: {:.0}",
+        evs.len(),
+        dur,
+        evs.len() as f64 / dur.max(0.001)
+    );
 
     let mut notes = 0u64;
     let mut offs = 0u64;
@@ -38,13 +43,14 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
             MidiEvent::ProgramChange { .. } => pc += 1,
         }
     }
-    println!(
-        "note_on: {notes}  note_off: {offs}  cc: {ccs}  pitchbend: {pb}  program: {pc}"
-    );
+    println!("note_on: {notes}  note_off: {offs}  cc: {ccs}  pitchbend: {pb}  program: {pc}");
     println!("per-channel:");
     for (ch, n) in per_chan.iter().enumerate() {
         if *n > 0 {
-            println!("  ch{ch}: {n}  (note_on: {})", note_cc.get(&(ch as u8)).unwrap_or(&0));
+            println!(
+                "  ch{ch}: {n}  (note_on: {})",
+                note_cc.get(&(ch as u8)).unwrap_or(&0)
+            );
         }
     }
     // Peak simultaneous voices estimate: count overlapping note-ons at the

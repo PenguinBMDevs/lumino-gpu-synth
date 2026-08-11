@@ -43,14 +43,8 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let sample_rate = 48_000;
     let config = SynthConfig {
         sample_rate,
-        // 4096-frame blocks balance the GPU's ~10ms fixed submit cost against
-        // per-frame voice work.
-        block_size: 4096,
-        // Cap the voice pool tight: the GPU is the throughput limit on this
-        // machine (submit ~10ms/block even for a handful of voices), and
-        // each thousand voices adds GPU dispatch time. 2048 voices is plenty
-        // for dense black-MIDI peaks (~5.5k notes get stolen down to fit).
-        max_voices: 2048,
+        block_size: 2048,
+        max_voices: 512,
         show_progress: false,
         ..SynthConfig::default()
     };

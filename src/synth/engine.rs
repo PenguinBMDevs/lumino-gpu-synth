@@ -42,7 +42,11 @@ const MAX_RENDER_FRAMES: u64 = 1 << 31;
 /// with a large block size a lag of a few blocks lets thousands of dead
 /// voices accumulate (dense MIDI adds thousands per block), bloating the
 /// GPU voice pool to the physical buffer-size wall. One block of lag is the
-/// right trade-off (a single extra map per block is cheap).
+/// right trade-off (a single extra map per block is cheap). Voice states are
+/// read back every `STATES_SYNC_EVERY` blocks: a voice ending late does not
+/// change any audio sample, and skipping the extra map/poll round trip per
+/// block is a large CPU win. Kept at 1 for exactness - raising it resumes
+/// voices from stale states (risk of audio replay), which the user forbade.
 const STATES_SYNC_EVERY: u32 = 1;
 
 /// Hard cap for the voice output buffer (per-voice output for one block).
@@ -219,6 +223,11 @@ pub struct GpuSynth {
     /// Submission index of the previously dispatched block; the CPU waits
     /// for this one (not the current) so GPU work pipelines with CPU work.
     prev_submission: Option<wgpu::SubmissionIndex>,
+    /// Persistent staging belt: reuses staging buffers across blocks so the
+    /// per-block `queue.write_buffer` (which allocates + copies a fresh
+    /// staging buffer every call) stops dominating the render time. Measured
+    /// 35ms/block for ~400KB of voice uploads vs ~2ms with a belt.
+    belt: wgpu::util::StagingBelt,
 }
 
 impl GpuSynth {
@@ -398,6 +407,7 @@ impl GpuSynth {
             voice_id_counter: 0,
             states_sync_counter: 0,
             prev_submission: None,
+            belt: wgpu::util::StagingBelt::new(1 << 20),
         };
         engine.rebuild_bind_groups();
         Ok(engine)
@@ -1371,8 +1381,6 @@ impl GpuSynth {
         }
 
         self.rebuild_key_voices();
-        let device = &self.res.ctx.device;
-        let queue = &self.res.ctx.queue;
 
         let n = self.voices.len();
         // Reuse the per-block upload buffers: `resize` keeps the allocation,
@@ -1470,42 +1478,12 @@ impl GpuSynth {
                     0u32
                 }) << 7);
         }
-
-        if self
-            .params_buf
-            .write(device, queue, 0, bytemuck::cast_slice(&params))?
-        {
-            self.render_bg_dirty = true;
-        }
-        if self
-            .states_buf
-            .write(device, queue, 0, bytemuck::cast_slice(&states))?
-        {
-            self.render_bg_dirty = true;
-        }
-        if self
-            .env_buf
-            .write(device, queue, 0, bytemuck::cast_slice(&env_stages))?
-        {
-            self.render_bg_dirty = true;
-        }
-        if self
-            .voice_chans_buf
-            .write(device, queue, 0, bytemuck::cast_slice(&voice_chans))?
-        {
-            self.render_bg_dirty = true;
-            self.mix_bg_dirty = true;
-        }
-
+        // (Upload is deferred to `dispatch` so all GPU work - staging copies,
+        // render pass, readback copies - happens in ONE submit; separate
+        // submits measured ~9ms each of fixed wgpu/Vulkan overhead.)
         self.active_voice_count = n as u32;
-        // NOTE: no unconditional `render_bg_dirty` here. The four `write()`
-        // calls above already flag dirty on actual buffer *growth*; flagging
-        // unconditionally rebuilt both bind groups every block (pure CPU+GPU
-        // waste - bind groups only depend on the buffers, not their
-        // contents).
         Ok(())
     }
-
     fn upload_new_samples(&mut self) -> Result<(), SynthError> {
         let sf = match self.sf.as_mut() {
             Some(sf) => sf,
@@ -1812,6 +1790,57 @@ impl GpuSynth {
             label: Some("lumino block encoder"),
         });
 
+        // Voice parameter uploads, staged through the persistent belt into
+        // the SAME submission as the compute passes (one submit per block).
+        {
+            let n = (self.active_voice_count as usize)
+                .min(self.upload_params.len())
+                .max(1);
+            self.belt
+                .write_buffer(
+                    &mut encoder,
+                    self.params_buf.buffer(),
+                    0,
+                    wgpu::BufferSize::new((std::mem::size_of::<VoiceParams>() * n) as u64).unwrap(),
+                    device,
+                )
+                .copy_from_slice(bytemuck::cast_slice(&self.upload_params[..n]));
+            self.belt
+                .write_buffer(
+                    &mut encoder,
+                    self.states_buf.buffer(),
+                    0,
+                    wgpu::BufferSize::new((std::mem::size_of::<VoiceState>() * n) as u64).unwrap(),
+                    device,
+                )
+                .copy_from_slice(bytemuck::cast_slice(&self.upload_states[..n]));
+            if !self.upload_env_stages.is_empty() {
+                self.belt
+                    .write_buffer(
+                        &mut encoder,
+                        self.env_buf.buffer(),
+                        0,
+                        wgpu::BufferSize::new(
+                            (std::mem::size_of::<EnvStageGpu>() * self.upload_env_stages.len())
+                                as u64,
+                        )
+                        .unwrap(),
+                        device,
+                    )
+                    .copy_from_slice(bytemuck::cast_slice(&self.upload_env_stages));
+            }
+            self.belt
+                .write_buffer(
+                    &mut encoder,
+                    self.voice_chans_buf.buffer(),
+                    0,
+                    wgpu::BufferSize::new((4 * n) as u64).unwrap(),
+                    device,
+                )
+                .copy_from_slice(bytemuck::cast_slice(&self.upload_chans[..n]));
+            self.belt.finish();
+        }
+
         let render_bg = self
             .render_bg
             .as_ref()
@@ -1963,6 +1992,9 @@ impl GpuSynth {
         } else {
             0
         };
+        // The GPU has consumed this block's staging copies (the poll above
+        // waited for the submission); recycle the belt slices for next block.
+        self.belt.recall();
         Ok(())
     }
     fn readback(&mut self, out: &mut [f32]) -> Result<(), SynthError> {

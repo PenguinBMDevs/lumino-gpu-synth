@@ -245,9 +245,7 @@ impl AudioPlayback {
                     // not debit the buffer counter (that would make the
                     // render thread see a fake, ever-growing debt and pace
                     // itself wrong).
-                    cb_stats
-                        .samples
-                        .fetch_sub(i as i64, Ordering::SeqCst);
+                    cb_stats.samples.fetch_sub(i as i64, Ordering::SeqCst);
                     cb_stats
                         .last_samples_after_read
                         .store(cb_stats.samples.load(Ordering::SeqCst), Ordering::Relaxed);
@@ -348,6 +346,13 @@ impl AudioPlayback {
                         .samples
                         .fetch_add(out.len() as i64, Ordering::SeqCst);
 
+                    // Record the actual GPU/CPU render cost (render_block +
+                    // resample), NOT including the cadence sleep below - the
+                    // sleep is deliberate pacing, not render load.
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let total = delay.as_secs_f64();
+                    thread_stats.push_render_load(elapsed / total);
+
                     // Push without dropping: wait while the queue is full.
                     loop {
                         if sample_tx.try_send(out.clone()).is_ok() {
@@ -360,6 +365,10 @@ impl AudioPlayback {
                     }
 
                     // Record the render-load percentage (elapsed / budget).
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let total = delay.as_secs_f64();
+                    thread_stats.push_render_load(elapsed / total);
+
                     let elapsed = start.elapsed().as_secs_f64();
                     let total = delay.as_secs_f64();
                     thread_stats.push_render_load(elapsed / total);

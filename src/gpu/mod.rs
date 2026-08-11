@@ -21,8 +21,10 @@ pub const SAMPLES_CHUNKS: usize = 4;
 /// Number of segments each voice block is split into (gid.y of the render
 /// kernel). More segments = more GPU parallelism for dense polyphony; the
 /// shader fast-forwards the voice state to each segment start. 16 segments
-/// of a 1024-frame block = 64 frames per thread.
-pub const RENDER_SEGMENTS: u32 = 1;
+/// of a 1024-frame block = 64 frames per thread. Filtered (biquad) voices
+/// are signal-dependent and fall back to single-segment rendering, which is
+/// correct (just less parallel) - so audio quality is unaffected.
+pub const RENDER_SEGMENTS: u32 = 16;
 
 /// Capacity of one sample chunk in bytes (1 GiB, well below the 2 GiB
 /// `max_storage_buffer_binding_size` requested from the adapter).
