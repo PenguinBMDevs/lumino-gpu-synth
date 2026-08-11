@@ -52,7 +52,8 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     }
     for r in 0..reps as u64 {
         for &key in &keys {
-            let at = r as u64 * (gap * sample_rate) as u64 + key as u64 * 128
+            let at = r as u64 * (gap * sample_rate) as u64
+                + key as u64 * 128
                 + (note_len * sample_rate) as u64;
             while frame < at {
                 let mut buf = vec![0.0f32; block as usize * 2];

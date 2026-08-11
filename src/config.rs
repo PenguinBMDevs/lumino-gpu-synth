@@ -28,6 +28,16 @@ pub enum ChannelMode {
     Mono,
 }
 
+impl ChannelMode {
+    /// The number of output channels.
+    pub fn channel_count(self) -> usize {
+        match self {
+            ChannelMode::Stereo => 2,
+            ChannelMode::Mono => 1,
+        }
+    }
+}
+
 /// Configuration for a [`crate::GpuSynth`] instance.
 ///
 /// # Example

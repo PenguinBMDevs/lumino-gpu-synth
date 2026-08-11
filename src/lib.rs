@@ -12,9 +12,11 @@
 //!
 //! - **Offline rendering**: render a complete MIDI file to a WAV file (or to
 //!   raw samples) with [`GpuSynth::render_midi_file`].
-//! - **Realtime playback**: stream sample blocks through
-//!   [`GpuSynth::render_block`] (see [`audio::playback`] for a `cpal`-based
-//!   helper).
+//! - **Realtime playback**: play live MIDI input through the default audio
+//!   device with [`AudioPlayback`] (a `cpal`-backed helper that owns the
+//!   engine on a render thread). The device sample rate is negotiated
+//!   automatically; when it differs from the engine's, the output is
+//!   linearly resampled.
 //! - **SF2 soundfonts**: parsed with `xsynth-soundfonts`, so the synthesis
 //!   model matches the XSynth engine (volume envelopes, cutoff filter,
 //!   velocity/key modulation curves, stereo pan).
@@ -64,6 +66,7 @@ pub mod midi;
 pub mod soundfont;
 pub mod synth;
 
+pub use audio::playback::AudioPlayback;
 pub use audio::wav;
 pub use config::{ChannelMode, InterpolationMode, SynthConfig};
 pub use error::{SoundFontError, SynthError};

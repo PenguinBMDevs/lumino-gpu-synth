@@ -86,13 +86,15 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
             short += 1;
         }
     }
-    println!(
-        "single-key high-rate: notes={reps} sounding={sounding} short={short}"
-    );
+    println!("single-key high-rate: notes={reps} sounding={sounding} short={short}");
     if sounding == reps as usize && short == 0 {
         println!("PASS: no dropped notes, no truncation at extreme density");
     } else {
-        println!("FAIL: {} silent / {} short", reps as usize - sounding, short);
+        println!(
+            "FAIL: {} silent / {} short",
+            reps as usize - sounding,
+            short
+        );
     }
     Ok(())
 }
