@@ -2,11 +2,15 @@
 //!
 //! # Architecture
 //!
-//! The engine is owned by a background **render thread**; MIDI events are
-//! sent through a channel and rendered blocks are pushed into the audio
-//! callback via a bounded sync channel. The audio callback runs on the
-//! OS audio thread and must never block - it only copies from the queue
-//! and writes silence on underrun.
+//! The engine is owned by a background **render thread** that renders
+//! continuously, paced by the block's realtime budget (90% of wall-clock
+//! duration). MIDI events are sent through a channel and drained before
+//! each block. Rendered blocks are pushed to the audio callback through a
+//! bounded queue; when the render thread is ahead of the consumer by more
+//! than 10% it sleeps, otherwise it keeps rendering — it **never drops a
+//! block**. The audio callback runs on the OS audio thread and must never
+//! block: it only copies from the queue and writes silence on underrun
+//! (counting them in the stats).
 //!
 //! # Sample-rate negotiation
 //!
@@ -18,10 +22,12 @@
 //! interpolator. Use [`AudioPlayback::device_sample_rates`] to list what
 //! a device supports before constructing the engine.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -29,6 +35,74 @@ use super::resample::LinearResampler;
 use crate::GpuSynth;
 use crate::SynthError;
 use crate::midi::MidiEvent;
+
+/// Read-only view of the realtime playback statistics.
+///
+/// Mirrors the stats exposed by XSynth's `BufferedRenderer` so a status
+/// line like "Voice Count / Buffer / Render time" can be printed while
+/// playing.
+#[derive(Clone)]
+pub struct PlaybackStatsReader {
+    samples: Arc<AtomicI64>,
+    last_request_samples: Arc<AtomicI64>,
+    last_samples_after_read: Arc<AtomicI64>,
+    render_time: Arc<std::sync::Mutex<VecDeque<f64>>>,
+    render_size: Arc<AtomicU64>,
+    voice_count: Arc<AtomicU64>,
+    underruns: Arc<AtomicU64>,
+}
+
+impl PlaybackStatsReader {
+    /// The number of samples currently buffered (rendered but not yet
+    /// consumed). Can be negative if the reader is waiting for samples.
+    pub fn samples(&self) -> i64 {
+        self.samples.load(Ordering::Relaxed)
+    }
+
+    /// The number of samples requested by the last audio callback.
+    pub fn last_request_samples(&self) -> i64 {
+        self.last_request_samples.load(Ordering::Relaxed)
+    }
+
+    /// The number of samples that were in the buffer after the last read.
+    pub fn last_samples_after_read(&self) -> i64 {
+        self.last_samples_after_read.load(Ordering::Relaxed)
+    }
+
+    /// The number of samples rendered per iteration.
+    pub fn render_size(&self) -> usize {
+        self.render_size.load(Ordering::Relaxed) as usize
+    }
+
+    /// The average render-time percentage (0 to 1) of how long the render
+    /// thread spent rendering, relative to the max allowed time. Values
+    /// above 1.0 mean the render thread cannot keep up with realtime.
+    pub fn average_renderer_load(&self) -> f64 {
+        let queue = self.render_time.lock().unwrap();
+        if queue.is_empty() {
+            0.0
+        } else {
+            queue.iter().sum::<f64>() / queue.len() as f64
+        }
+    }
+
+    /// The last render-time percentage (0 to 1).
+    pub fn last_renderer_load(&self) -> f64 {
+        let queue = self.render_time.lock().unwrap();
+        queue.front().copied().unwrap_or(0.0)
+    }
+
+    /// The active voice count reported by the engine on the last render.
+    pub fn voice_count(&self) -> u64 {
+        self.voice_count.load(Ordering::Relaxed)
+    }
+
+    /// The number of underruns (audio callbacks that found no buffered
+    /// samples and wrote silence). Zero is the healthy state.
+    pub fn underruns(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+}
 
 /// A running realtime playback session.
 ///
@@ -54,6 +128,7 @@ pub struct AudioPlayback {
     thread: Option<JoinHandle<()>>,
     sample_rate: u32,
     engine_rate: u32,
+    stats: PlaybackStatsReader,
     _stream: Option<cpal::Stream>,
 }
 
@@ -88,10 +163,23 @@ impl AudioPlayback {
 
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let (event_tx, event_rx) = mpsc::channel::<(u8, MidiEvent)>();
-        let (sample_tx, sample_rx) = mpsc::sync_channel::<Vec<f32>>(4);
+        let (sample_tx, sample_rx) = mpsc::sync_channel::<Vec<f32>>(16);
         let stop_flag = Arc::new(AtomicBool::new(false));
 
+        // Stats shared between the callback, the render thread and the caller.
+        let stats = PlaybackStatsReader {
+            samples: Arc::new(AtomicI64::new(0)),
+            last_request_samples: Arc::new(AtomicI64::new(0)),
+            last_samples_after_read: Arc::new(AtomicI64::new(0)),
+            render_time: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            render_size: Arc::new(AtomicU64::new((block * channels) as u64)),
+            voice_count: Arc::new(AtomicU64::new(0)),
+            underruns: Arc::new(AtomicU64::new(0)),
+        };
+        let cb_stats = stats.clone();
+
         // Audio callback: pull blocks from the queue into the device buffer.
+        // Never blocks; on underrun it writes silence and counts it.
         let err_fn = |e| eprintln!("lumino-gpu-synth playback error: {e}");
         let mut next_block: Vec<f32> = Vec::new();
         let mut next_pos = 0usize;
@@ -99,6 +187,9 @@ impl AudioPlayback {
             .build_output_stream(
                 stream_config,
                 move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                    cb_stats
+                        .last_request_samples
+                        .store(data.len() as i64, Ordering::SeqCst);
                     let mut i = 0;
                     while i < data.len() {
                         if next_pos >= next_block.len() {
@@ -110,6 +201,7 @@ impl AudioPlayback {
                                 Err(_) => {
                                     // Underrun: silence the remainder.
                                     data[i..].fill(0.0);
+                                    cb_stats.underruns.fetch_add(1, Ordering::Relaxed);
                                     break;
                                 }
                             }
@@ -120,6 +212,12 @@ impl AudioPlayback {
                             next_pos += n;
                         }
                     }
+                    cb_stats
+                        .samples
+                        .fetch_sub(data.len() as i64, Ordering::SeqCst);
+                    cb_stats
+                        .last_samples_after_read
+                        .store(cb_stats.samples.load(Ordering::SeqCst), Ordering::Relaxed);
                 },
                 err_fn,
                 None,
@@ -129,18 +227,26 @@ impl AudioPlayback {
             .play()
             .map_err(|e| SynthError::Gpu(format!("audio stream play: {e}")))?;
 
-        // Render thread: owns the engine, drains incoming events, renders
-        // blocks (optionally resampling to the device rate) and forwards
-        // them to the audio callback. Non-blocking pushes bound the wait so
-        // a stalled consumer can never deadlock `stop()`.
+        // Render thread: owns the engine and renders continuously. The
+        // cadence is the block's wall-clock duration * 90% so the thread can
+        // catch up when a block is slow. If it is more than 10% ahead of the
+        // consumer it sleeps; otherwise it keeps rendering. Blocks are never
+        // dropped: if the queue is full we wait (the consumer is draining).
         let thread_stop = stop_flag.clone();
+        let thread_stats = stats.clone();
         let thread = thread::Builder::new()
             .name("lumino-gpu-synth-render".into())
             .spawn(move || {
                 let mut synth = synth;
                 let mut buf = vec![0.0f32; block * channels];
                 let mut resampler = LinearResampler::new(engine_rate, device_rate, channels);
-                let drain_timeout = std::time::Duration::from_millis(5);
+                // Max allowed render time per block: 90% of realtime so the
+                // thread stays slightly ahead and can absorb slow blocks.
+                // NOTE: based on `block` (one frame, all channels) — using
+                // `block * channels` would double the budget and starve the
+                // consumer (underruns / crackle).
+                let delay = Duration::from_secs_f64(block as f64 / engine_rate.max(1) as f64 * 0.9);
+
                 loop {
                     // Drain pending MIDI events (non-blocking).
                     while let Ok((ch, ev)) = event_rx.try_recv() {
@@ -149,32 +255,68 @@ impl AudioPlayback {
                     if thread_stop.load(Ordering::Relaxed) || stop_rx.try_recv().is_ok() {
                         break;
                     }
-                    // Wait a short while for more events before the next
-                    // block, so burst input is batched into fewer renders.
-                    if let Ok((ch, ev)) = event_rx.recv_timeout(drain_timeout) {
-                        synth.send_event(ch, ev);
-                        // Also drain anything else queued behind it.
-                        while let Ok((c, e)) = event_rx.try_recv() {
-                            synth.send_event(c, e);
+
+                    // Backpressure: if we are more than 10% ahead of the
+                    // last request, wait for the consumer to catch up.
+                    loop {
+                        let samples = thread_stats.samples.load(Ordering::SeqCst);
+                        let requested = thread_stats.last_request_samples.load(Ordering::SeqCst);
+                        if samples > requested * 110 / 100 {
+                            std::thread::sleep(delay / 10);
+                            if thread_stop.load(Ordering::Relaxed) || stop_rx.try_recv().is_ok() {
+                                return;
+                            }
+                        } else {
+                            break;
                         }
                     }
-                    if thread_stop.load(Ordering::Relaxed) || stop_rx.try_recv().is_ok() {
-                        break;
-                    }
+
+                    let start = Instant::now();
                     if synth.render_block(&mut buf).is_err() {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        std::thread::sleep(delay / 10);
                         continue;
                     }
+                    thread_stats
+                        .voice_count
+                        .store(synth.voice_count() as u64, Ordering::Relaxed);
+
                     let out = if needs_resample {
                         resampler.process(&buf)
                     } else {
                         buf.clone()
                     };
-                    // Non-blocking push: when the consumer is slow the queue
-                    // stays full and we simply skip this block instead of
-                    // blocking forever (which would deadlock `stop()`).
-                    if sample_tx.try_send(out).is_err() {
-                        std::thread::sleep(drain_timeout);
+                    thread_stats
+                        .samples
+                        .fetch_add(out.len() as i64, Ordering::SeqCst);
+
+                    // Push without dropping: wait while the queue is full.
+                    loop {
+                        if sample_tx.try_send(out.clone()).is_ok() {
+                            break;
+                        }
+                        if thread_stop.load(Ordering::Relaxed) || stop_rx.try_recv().is_ok() {
+                            return;
+                        }
+                        std::thread::sleep(delay / 10);
+                    }
+
+                    // Record the render-load percentage (elapsed / budget).
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let total = delay.as_secs_f64();
+                    {
+                        let mut queue = thread_stats.render_time.lock().unwrap();
+                        queue.push_front(elapsed / total);
+                        if queue.len() > 100 {
+                            queue.pop_back();
+                        }
+                    }
+
+                    // Sleep until the next cadence point so we render at
+                    // ~90% of realtime and stay slightly ahead.
+                    let now = Instant::now();
+                    let end = start + delay;
+                    if end > now {
+                        std::thread::sleep(end - now);
                     }
                 }
             })
@@ -187,8 +329,17 @@ impl AudioPlayback {
             thread: Some(thread),
             sample_rate: device_rate,
             engine_rate,
+            stats,
             _stream: Some(stream),
         })
+    }
+
+    /// Returns a snapshot reader of the playback statistics.
+    ///
+    /// Useful for printing a live status line (voice count / buffer /
+    /// render load) while playing.
+    pub fn stats(&self) -> PlaybackStatsReader {
+        self.stats.clone()
     }
 
     /// Lists the sample rates the default output device supports (empty if

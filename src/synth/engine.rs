@@ -609,6 +609,67 @@ impl GpuSynth {
         self.render_midi_inner(midi_path, None)
     }
 
+    /// Pre-warms the GPU sample cache with every sample the MIDI file will
+    /// use (resampled and uploaded up front).
+    ///
+    /// Use this before realtime playback so the render loop never stalls on
+    /// a lazily-resampled sample during dense sections — otherwise a single
+    /// large sample can take hundreds of milliseconds to resample+upload in
+    /// the middle of a block, emptying the audio queue and causing crackle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SynthError::Midi`] if the file cannot be parsed, or
+    /// [`SynthError::Gpu`] on GPU failures.
+    pub fn prewarm_midi_file(
+        &mut self,
+        midi_path: impl AsRef<std::path::Path>,
+    ) -> Result<(), SynthError> {
+        let midi = MidiFile::load(midi_path, self.config.sample_rate)?;
+        let events = &midi.sequence.events;
+        if let Some(sf) = self.sf.as_ref() {
+            let mut wanted: Vec<usize> = Vec::new();
+            for ev in events {
+                if let MidiEvent::NoteOn { key, vel } = ev.event {
+                    for &zid in sf.zones_at(key, vel) {
+                        let zone = sf.zone(zid);
+                        wanted.push(zone.sample_id);
+                        wanted.push(zone.sample_id_r);
+                    }
+                }
+            }
+            wanted.sort_unstable();
+            wanted.dedup();
+            let rate = self.config.sample_rate;
+            let pre: Vec<(usize, Arc<[f32]>)> = wanted
+                .par_iter()
+                .map(|&id| (id, sf.resample_uncached(id, rate)))
+                .collect();
+            let sf = self.sf.as_mut().expect("soundfont present");
+            let device = &self.res.ctx.device;
+            let queue = &self.res.ctx.queue;
+            let mut grown = false;
+            for (id, data) in pre {
+                sf.cache_resampled(id, rate, data.clone());
+                let len = data.len() as u32;
+                let offset = self.samples_next_offset;
+                grown |= write_samples(
+                    &mut self.samples_chunks,
+                    device,
+                    queue,
+                    offset as u64 * 4,
+                    bytemuck::cast_slice(&data),
+                )?;
+                self.sample_offsets.insert(id, (offset, len));
+                self.samples_next_offset = offset + len;
+            }
+            if grown {
+                self.render_bg_dirty = true;
+            }
+        }
+        Ok(())
+    }
+
     /// Renders the first `frames` frames of a MIDI file (used to compare the
     /// beginning of long MIDIs without rendering the whole piece).
     ///
