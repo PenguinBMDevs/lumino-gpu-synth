@@ -34,10 +34,16 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
 
     // The engine renders at 48 kHz; `AudioPlayback::start` negotiates with
     // the device and resamples if needed.
+    //
+    // A larger block amortizes the per-block fixed costs (GPU dispatch,
+    // readback poll, CPU upload) and widens the realtime budget: 2048 frames
+    // at 48 kHz is 42.7 ms per block, so even a heavy 4000-voice dense
+    // section (a few ms of GPU per block) leaves ample headroom and the
+    // queue never starves.
     let sample_rate = 48_000;
     let config = SynthConfig {
         sample_rate,
-        block_size: 512,
+        block_size: 2048,
         show_progress: false,
         ..SynthConfig::default()
     };
@@ -79,10 +85,13 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     );
 
     // Live status thread: same stats as XSynth's realtime example.
+    // `print!` buffers, so flush every tick: otherwise the `\r` lines
+    // accumulate and burst out all at once (and a full stdout pipe blocks).
     let running = Arc::new(AtomicBool::new(true));
     let stats = playback.stats();
     let stats_running = running.clone();
     let stats_thread = std::thread::spawn(move || {
+        use std::io::Write;
         let mut last_underruns = 0u64;
         while stats_running.load(Ordering::Relaxed) {
             let underruns = stats.underruns();
@@ -94,6 +103,7 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
                 stats.last_samples_after_read(),
                 stats.average_renderer_load(),
             );
+            let _ = std::io::stdout().flush();
             std::thread::sleep(Duration::from_millis(100));
         }
     });

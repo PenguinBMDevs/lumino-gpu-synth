@@ -22,7 +22,6 @@
 //! interpolator. Use [`AudioPlayback::device_sample_rates`] to list what
 //! a device supports before constructing the engine.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -41,16 +40,26 @@ use crate::midi::MidiEvent;
 /// Mirrors the stats exposed by XSynth's `BufferedRenderer` so a status
 /// line like "Voice Count / Buffer / Render time" can be printed while
 /// playing.
+///
+/// All counters are lock-free (atomics + a fixed ring of `AtomicU64` slots):
+/// the render thread must never block on a lock, so stats are published
+/// with relaxed stores and readers take a best-effort snapshot.
 #[derive(Clone)]
 pub struct PlaybackStatsReader {
     samples: Arc<AtomicI64>,
     last_request_samples: Arc<AtomicI64>,
     last_samples_after_read: Arc<AtomicI64>,
-    render_time: Arc<std::sync::Mutex<VecDeque<f64>>>,
+    /// Ring of recent render-load percentages (0..n), stored as f64 bits in
+    /// `AtomicU64`. `render_time_head` is the next slot to write.
+    render_time: Arc<[AtomicU64; STATS_RING]>,
+    render_time_head: Arc<AtomicU64>,
     render_size: Arc<AtomicU64>,
     voice_count: Arc<AtomicU64>,
     underruns: Arc<AtomicU64>,
 }
+
+/// Number of recent render-load samples kept for the moving average.
+const STATS_RING: usize = 128;
 
 impl PlaybackStatsReader {
     /// The number of samples currently buffered (rendered but not yet
@@ -78,18 +87,34 @@ impl PlaybackStatsReader {
     /// thread spent rendering, relative to the max allowed time. Values
     /// above 1.0 mean the render thread cannot keep up with realtime.
     pub fn average_renderer_load(&self) -> f64 {
-        let queue = self.render_time.lock().unwrap();
-        if queue.is_empty() {
-            0.0
-        } else {
-            queue.iter().sum::<f64>() / queue.len() as f64
+        let head = self.render_time_head.load(Ordering::Relaxed) as usize;
+        let mut sum = 0.0f64;
+        let mut n = 0usize;
+        for i in 0..STATS_RING {
+            let bits =
+                self.render_time[(head + STATS_RING - 1 - i) % STATS_RING].load(Ordering::Relaxed);
+            if bits != 0 {
+                sum += f64::from_bits(bits);
+                n += 1;
+            }
         }
+        if n == 0 { 0.0 } else { sum / n as f64 }
     }
 
     /// The last render-time percentage (0 to 1).
     pub fn last_renderer_load(&self) -> f64 {
-        let queue = self.render_time.lock().unwrap();
-        queue.front().copied().unwrap_or(0.0)
+        let head = self.render_time_head.load(Ordering::Relaxed) as usize;
+        let slot = (head + STATS_RING - 1) % STATS_RING;
+        let bits = self.render_time[slot].load(Ordering::Relaxed);
+        if bits == 0 { 0.0 } else { f64::from_bits(bits) }
+    }
+
+    /// Publishes one render-load sample (render thread side; lock-free).
+    pub(crate) fn push_render_load(&self, load: f64) {
+        let head = self.render_time_head.load(Ordering::Relaxed) as usize;
+        self.render_time[head].store(load.to_bits(), Ordering::Relaxed);
+        let next = (head + 1) % STATS_RING;
+        self.render_time_head.store(next as u64, Ordering::Relaxed);
     }
 
     /// The active voice count reported by the engine on the last render.
@@ -171,7 +196,8 @@ impl AudioPlayback {
             samples: Arc::new(AtomicI64::new(0)),
             last_request_samples: Arc::new(AtomicI64::new(0)),
             last_samples_after_read: Arc::new(AtomicI64::new(0)),
-            render_time: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            render_time: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            render_time_head: Arc::new(AtomicU64::new(0)),
             render_size: Arc::new(AtomicU64::new((block * channels) as u64)),
             voice_count: Arc::new(AtomicU64::new(0)),
             underruns: Arc::new(AtomicU64::new(0)),
@@ -303,13 +329,7 @@ impl AudioPlayback {
                     // Record the render-load percentage (elapsed / budget).
                     let elapsed = start.elapsed().as_secs_f64();
                     let total = delay.as_secs_f64();
-                    {
-                        let mut queue = thread_stats.render_time.lock().unwrap();
-                        queue.push_front(elapsed / total);
-                        if queue.len() > 100 {
-                            queue.pop_back();
-                        }
-                    }
+                    thread_stats.push_render_load(elapsed / total);
 
                     // Sleep until the next cadence point so we render at
                     // ~90% of realtime and stay slightly ahead.

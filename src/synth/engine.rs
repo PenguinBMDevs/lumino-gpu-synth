@@ -1340,7 +1340,11 @@ impl GpuSynth {
         }
 
         self.active_voice_count = n as u32;
-        self.render_bg_dirty = true;
+        // NOTE: no unconditional `render_bg_dirty` here. The four `write()`
+        // calls above already flag dirty on actual buffer *growth*; flagging
+        // unconditionally rebuilt both bind groups every block (pure CPU+GPU
+        // waste - bind groups only depend on the buffers, not their
+        // contents).
         Ok(())
     }
 
@@ -1747,18 +1751,26 @@ impl GpuSynth {
         device
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(idx),
-                timeout: None,
+                // Bounded wait: a wedged GPU must surface as an error instead
+                // of stalling the realtime render thread forever.
+                timeout: Some(std::time::Duration::from_millis(100)),
             })
             .map_err(|e| SynthError::Gpu(format!("poll failed: {e:?}")))?;
 
-        if orx.recv().unwrap_or(false) {
+        if orx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .unwrap_or(false)
+        {
             self.last_out = Some(out_slice.get_mapped_range().to_vec());
             self.out_readback[read_cur].unmap();
         } else {
             return Err(SynthError::Gpu("output readback map failed".into()));
         }
         if let Some((s, srx)) = states_map {
-            if srx.recv().unwrap_or(false) {
+            if srx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .unwrap_or(false)
+            {
                 self.last_states = Some(s.get_mapped_range().to_vec());
                 self.states_readback[cur].buffer().unmap();
             } else {
