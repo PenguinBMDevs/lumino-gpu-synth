@@ -53,6 +53,7 @@ pub struct AudioPlayback {
     event_tx: Option<mpsc::Sender<(u8, MidiEvent)>>,
     thread: Option<JoinHandle<()>>,
     sample_rate: u32,
+    engine_rate: u32,
     _stream: Option<cpal::Stream>,
 }
 
@@ -185,6 +186,7 @@ impl AudioPlayback {
             event_tx: Some(event_tx),
             thread: Some(thread),
             sample_rate: device_rate,
+            engine_rate,
             _stream: Some(stream),
         })
     }
@@ -273,6 +275,11 @@ impl AudioPlayback {
     /// The device sample rate in use.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// The engine's render sample rate (events scheduled against this).
+    pub fn engine_sample_rate(&self) -> u32 {
+        self.engine_rate
     }
 
     /// Stops the render thread (and closes the audio stream).
