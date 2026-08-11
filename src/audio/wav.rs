@@ -106,7 +106,7 @@ pub fn read_wav_from(r: &mut impl Read) -> Result<WavData, SynthError> {
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / 2147483648.0)
             .collect(),
-        (3, 32) => raw
+        (3, 32) | (65534, 32) => raw
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),

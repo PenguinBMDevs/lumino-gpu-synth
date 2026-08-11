@@ -9,7 +9,10 @@
 use lumino_gpu_synth::{GpuSynth, SynthConfig};
 
 fn main() -> Result<(), lumino_gpu_synth::SynthError> {
-    let config = SynthConfig::default();
+    let config = SynthConfig {
+        block_size: 2048,
+        ..SynthConfig::default()
+    };
     println!(
         "initializing GPU synth: {} Hz, {} voices, block {}",
         config.sample_rate, config.max_voices, config.block_size
@@ -18,8 +21,12 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let mut synth = GpuSynth::new(config)?;
     println!("adapter: {}", synth.adapter_info().name);
 
+    let t_sf = std::time::Instant::now();
     synth.load_soundfont("assets/test.sf2", 0, 0)?;
-    println!("soundfont loaded (bank 0 preset 0)");
+    println!(
+        "soundfont loaded (bank 0 preset 0) in {:.2?}",
+        t_sf.elapsed()
+    );
 
     let start = std::time::Instant::now();
     let result = synth.render_midi_file("assets/right-example.mid")?;

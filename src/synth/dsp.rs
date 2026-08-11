@@ -266,10 +266,48 @@ pub fn modify_env_stages(
         let dur = curve(release_val, old).max(0.02) * sample_rate as f32;
         stage.duration = dur as u32;
     }
+
+    // Re-collapse curve stages whose duration became zero (e.g. CC73 = 0),
+    // mirroring XSynth's recursive skip in `get_stage_data`. A zero-duration
+    // curve stage would otherwise divide by zero in the GPU kernel (NaN
+    // output that never decays to silence) and its target value is exactly
+    // what the next stage starts from anyway.
+    //
+    // Note: the release stage can never collapse here (it has a 20 ms floor,
+    // see above). If it *was* already collapsed by `to_gpu_stages`, the
+    // release index points at the terminal hold stage and `None`/the caller's
+    // `stages.len() - 1` fallback are equivalent.
+    let old_attack = envelope.attack_idx;
+    let old_release = envelope.release_idx;
+    let mut collapsed: Vec<EnvStage> = Vec::with_capacity(envelope.stages.len());
+    let mut new_attack = None;
+    let mut new_release = None;
+    for (i, stage) in envelope.stages.iter().enumerate() {
+        let is_curve = matches!(
+            stage.kind,
+            EnvStage::LERP | EnvStage::CONCAVE | EnvStage::CONVEX
+        );
+        if is_curve && stage.duration == 0 {
+            // Skipped: the next stage effectively starts from this target.
+            continue;
+        }
+        let ni = collapsed.len();
+        if Some(i) == old_attack {
+            new_attack = Some(ni);
+        }
+        if Some(i) == old_release {
+            new_release = Some(ni);
+        }
+        collapsed.push(*stage);
+    }
+    envelope.stages = collapsed;
+    envelope.attack_idx = new_attack;
+    envelope.release_idx = new_release;
 }
 
-/// Computes the resonance Q for the filter, mirroring XSynth:
-/// `db_to_amp(resonance_db) * Q_BUTTERWORTH`.
+/// Computes the resonance Q for the filter, mirroring XSynth's
+/// `SampleSoundfont` voice parameters:
+/// `db_to_amp(resonance_db) * Q_BUTTERWORTH_F32`.
 pub fn resonance_to_q(resonance_db: f32) -> f32 {
     db_to_amp(resonance_db) * std::f32::consts::FRAC_1_SQRT_2
 }
@@ -422,5 +460,119 @@ mod tests {
                 .sum();
             assert!((sum - 1.0).abs() < 0.02, "phase {phase}: sum = {sum}");
         }
+    }
+
+    #[test]
+    fn modify_collapses_zero_duration_attack() {
+        // CC73 = 0 collapses the attack stage: it must not survive as a
+        // zero-duration curve stage (which would NaN-divide on the GPU).
+        let env = EnvelopeDescriptor {
+            start_percent: 0.0,
+            delay: 0.0,
+            attack: 0.01,
+            hold: 0.05,
+            decay: 0.05,
+            sustain_percent: 0.4,
+            release: 0.1,
+        };
+        let mut gpu_env = to_gpu_stages(&env, 64_000, EnvelopeCurveConfig::default());
+        assert_eq!(gpu_env.attack_idx, Some(0));
+        modify_env_stages(&mut gpu_env, 64_000, Some(0), None);
+        // Attack collapsed -> first stage must be the hold stage, and no
+        // zero-duration curve stage may remain anywhere.
+        assert_eq!(gpu_env.attack_idx, None);
+        for stage in &gpu_env.stages {
+            assert!(
+                !(stage.duration == 0 && stage.kind != EnvStage::HOLD),
+                "zero-duration curve stage survived: {stage:?}"
+            );
+        }
+        assert_eq!(gpu_env.stages[0].target, 1.0); // hold
+        assert_eq!(gpu_env.stages[0].duration, 3200); // 0.05 s @ 64 kHz
+    }
+
+    #[test]
+    fn modify_release_has_minimum_duration() {
+        // CC72 has a 20 ms floor (`max(0.02)`), so even a value of 0 must
+        // keep a positive duration (never a zero-duration curve stage).
+        let env = EnvelopeDescriptor {
+            start_percent: 0.0,
+            delay: 0.0,
+            attack: 0.01,
+            hold: 0.05,
+            decay: 0.05,
+            sustain_percent: 0.4,
+            release: 0.1,
+        };
+        let mut gpu_env = to_gpu_stages(&env, 64_000, EnvelopeCurveConfig::default());
+        modify_env_stages(&mut gpu_env, 64_000, None, Some(0));
+        for stage in &gpu_env.stages {
+            assert!(
+                !(stage.duration == 0 && stage.kind != EnvStage::HOLD),
+                "zero-duration curve stage survived: {stage:?}"
+            );
+        }
+        let ri = gpu_env.release_idx.expect("release stage must remain");
+        assert_eq!(gpu_env.stages[ri].kind, EnvStage::CONCAVE);
+        assert_eq!(gpu_env.stages[ri].duration, 1280); // 0.02 s @ 64 kHz
+    }
+
+    #[test]
+    fn modify_remaps_release_when_collapsed() {
+        // A release stage with zero duration (already collapsed shape, e.g.
+        // from a pathological soundfont) must not resurrect as a curve stage.
+        let mut gpu_env = GpuEnvelope {
+            stages: vec![
+                EnvStage {
+                    kind: EnvStage::LERP,
+                    target: 1.0,
+                    duration: 600,
+                },
+                EnvStage {
+                    kind: EnvStage::CONCAVE,
+                    target: 0.0,
+                    duration: 0, // zero-duration release
+                },
+                EnvStage {
+                    kind: EnvStage::HOLD,
+                    target: 0.0,
+                    duration: 0,
+                },
+            ],
+            attack_idx: Some(0),
+            release_idx: Some(1),
+        };
+        modify_env_stages(&mut gpu_env, 64_000, None, None);
+        assert_eq!(gpu_env.stages.len(), 2);
+        // Release collapsed away; the index falls back to the terminal
+        // stage via `None` (callers use `stages.len() - 1`).
+        assert_eq!(gpu_env.release_idx, None);
+        assert!(
+            gpu_env
+                .stages
+                .iter()
+                .all(|s| s.duration > 0 || s.kind == EnvStage::HOLD)
+        );
+    }
+
+    #[test]
+    fn modify_keeps_indices_when_no_zero_stages() {
+        // CC values that keep durations positive must not disturb the
+        // attack/release indices.
+        let env = EnvelopeDescriptor {
+            start_percent: 0.0,
+            delay: 0.0,
+            attack: 0.01,
+            hold: 0.05,
+            decay: 0.05,
+            sustain_percent: 0.4,
+            release: 0.1,
+        };
+        let mut gpu_env = to_gpu_stages(&env, 64_000, EnvelopeCurveConfig::default());
+        let (attack_before, release_before) = (gpu_env.attack_idx, gpu_env.release_idx);
+        modify_env_stages(&mut gpu_env, 64_000, Some(64), Some(64));
+        assert_eq!(gpu_env.attack_idx, attack_before);
+        assert_eq!(gpu_env.release_idx, release_before);
+        assert_eq!(gpu_env.stages.len(), 6); // unchanged shape
     }
 }

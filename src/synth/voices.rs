@@ -15,8 +15,14 @@ use crate::synth::dsp::{
 pub struct Voice {
     /// Index of this voice in the engine's voice list (GPU voice id).
     pub id: u32,
+    /// Spawn batch id: all zones of one note-on share it. Voice stealing
+    /// kills whole batches (like XSynth's voice groups) so a stereo pair
+    /// is never split.
+    pub note_id: u64,
     /// MIDI key.
     pub key: u8,
+    /// MIDI velocity (used to steal the quietest voice, like XSynth).
+    pub vel: u8,
     /// MIDI channel.
     pub channel: u8,
     /// Zone id in the soundfont.
@@ -179,11 +185,11 @@ pub fn build_voice(
     let pan_l = (pan.cos() * 1.42).min(1.0);
     let pan_r = (pan.sin() * 1.42).min(1.0);
 
-    let _ = vel;
-
     Some(Voice {
         id: 0,
+        note_id: 0,
         key,
+        vel,
         channel,
         zone_id,
         state: VoiceState {

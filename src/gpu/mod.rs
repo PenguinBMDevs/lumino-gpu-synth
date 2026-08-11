@@ -8,6 +8,40 @@ use std::sync::Arc;
 
 use crate::SynthError;
 
+/// Number of fixed sample chunks bound to the render pipeline.
+///
+/// The sample data of a large soundfont (16-bit PCM resampled to f32 at a
+/// higher rate) easily exceeds 1 GiB, far above the conservative 128 MiB
+/// per-binding limit. The samples therefore live in a few fixed-size
+/// chunks, each bound as its own storage binding; the device limits below
+/// raise the per-binding size to 2 GiB (supported by all mainstream Vulkan
+/// GPUs).
+pub const SAMPLES_CHUNKS: usize = 4;
+
+/// Number of segments each voice block is split into (gid.y of the render
+/// kernel). More segments = more GPU parallelism for dense polyphony; the
+/// shader fast-forwards the voice state to each segment start. 16 segments
+/// of a 1024-frame block = 64 frames per thread.
+pub const RENDER_SEGMENTS: u32 = 1;
+
+/// Capacity of one sample chunk in bytes (1 GiB, well below the 2 GiB
+/// `max_storage_buffer_binding_size` requested from the adapter).
+pub const SAMPLES_CHUNK_BYTES: u64 = 1 << 30;
+
+/// Capacity of one sample chunk in `f32` words (must match `render.wgsl`).
+pub const SAMPLES_CHUNK_F32: u32 = (SAMPLES_CHUNK_BYTES / 4) as u32;
+
+/// Binding index of the first sample chunk in the render bind group.
+pub const SAMPLES_CHUNK_BINDING_BASE: u32 = 1;
+/// Binding index of the sinc table (after the 8 sample chunks).
+pub const SINC_BINDING: u32 = SAMPLES_CHUNK_BINDING_BASE + SAMPLES_CHUNKS as u32;
+/// Binding index of the envelope stages.
+pub const ENV_BINDING: u32 = SINC_BINDING + 1;
+/// Binding index of the voice states (read-write).
+pub const STATES_BINDING: u32 = ENV_BINDING + 1;
+/// Binding index of the voice output (read-write).
+pub const VOICE_OUT_BINDING: u32 = STATES_BINDING + 1;
+
 /// A ready-to-use GPU device/queue pair.
 #[derive(Debug)]
 pub struct GpuContext {
@@ -21,14 +55,17 @@ pub struct GpuContext {
 
 /// Creates a [`GpuContext`] using the default high-performance adapter.
 ///
-/// Falls back from any backend failure to the fallback adapter, then errors.
+/// The backend is pinned to Vulkan: the render kernel binds 13 storage
+/// buffers per stage, and Vulkan's `maxPerStageDescriptorStorageBuffers`
+/// is much higher than D3D12's conservative default of 8 (which wgpu
+/// enforces even on DX12).
 ///
 /// # Errors
 ///
 /// Returns [`SynthError::GpuInit`] when no usable adapter/device exists.
 pub fn create_gpu_context() -> Result<GpuContext, SynthError> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::all(),
+        backends: wgpu::Backends::VULKAN,
         ..Default::default()
     });
 
@@ -42,7 +79,15 @@ pub fn create_gpu_context() -> Result<GpuContext, SynthError> {
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("lumino-gpu-synth"),
         required_features: wgpu::Features::empty(),
-        required_limits: wgpu::Limits::default(),
+        required_limits: wgpu::Limits {
+            // 4 sample chunks + sinc + env + states + voice_out + params.
+            max_storage_buffers_per_shader_stage: 16,
+            // 1 GiB chunks; Vulkan GPUs report 2 GiB - 1 storage buffer
+            // range and buffer size.
+            max_storage_buffer_binding_size: (1 << 31) - 1,
+            max_buffer_size: (1 << 31) - 1,
+            ..wgpu::Limits::default()
+        },
         memory_hints: wgpu::MemoryHints::default(),
         experimental_features: Default::default(),
         trace: wgpu::Trace::Off,
@@ -62,6 +107,7 @@ pub fn create_gpu_context() -> Result<GpuContext, SynthError> {
 pub struct GrowableBuffer {
     buffer: wgpu::Buffer,
     size: u64,
+    max_capacity: u64,
     usage: wgpu::BufferUsages,
     label: String,
 }
@@ -74,19 +120,45 @@ impl GrowableBuffer {
         capacity: u64,
         usage: wgpu::BufferUsages,
     ) -> Self {
-        let size = capacity.max(16);
+        Self::with_max_capacity(device, label, capacity, u64::MAX, usage)
+    }
+
+    /// Creates a growable storage buffer whose size is capped at
+    /// `max_capacity` bytes. Growth past the cap fails on write instead of
+    /// allocating unbounded memory.
+    pub fn with_max_capacity(
+        device: &wgpu::Device,
+        label: &str,
+        capacity: u64,
+        max_capacity: u64,
+        usage: wgpu::BufferUsages,
+    ) -> Self {
+        let size = capacity.max(16).min(max_capacity);
+        let effective = Self::effective_usage(usage);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size,
-            usage: usage | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            usage: effective,
             mapped_at_creation: false,
         });
         Self {
             buffer,
             size,
+            max_capacity,
             usage,
             label: label.to_string(),
         }
+    }
+
+    /// `MAP_READ` buffers are copy *destinations* only (`COPY_SRC` combined
+    /// with `MAP_READ` is rejected by wgpu); everything else also needs
+    /// `COPY_SRC` so growth can carry the old contents over.
+    fn effective_usage(usage: wgpu::BufferUsages) -> wgpu::BufferUsages {
+        let mut u = usage;
+        if !u.contains(wgpu::BufferUsages::MAP_READ) {
+            u |= wgpu::BufferUsages::COPY_SRC;
+        }
+        u | wgpu::BufferUsages::COPY_DST
     }
 
     /// Returns the current backing buffer.
@@ -99,28 +171,62 @@ impl GrowableBuffer {
         self.size
     }
 
+    /// Grows the buffer so it holds at least `needed` bytes, preserving the
+    /// old contents when the buffer can act as a copy source (returns
+    /// `true` if it grew, so callers can rebuild bind groups).
+    pub fn ensure(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, needed: u64) -> bool {
+        if needed <= self.size {
+            return false;
+        }
+        let new_size = (self.size * 2).max(needed).min(self.max_capacity);
+        let new_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&self.label),
+            size: new_size,
+            usage: Self::effective_usage(self.usage),
+            mapped_at_creation: false,
+        });
+        let can_copy_src = !self.usage.contains(wgpu::BufferUsages::MAP_READ);
+        if self.size > 0 && can_copy_src {
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            encoder.copy_buffer_to_buffer(&self.buffer, 0, &new_buf, 0, self.size);
+            queue.submit(Some(encoder.finish()));
+        }
+        self.buffer = new_buf;
+        self.size = new_size;
+        true
+    }
+
     /// Writes `data` at `offset`, growing the buffer first if needed.
     ///
     /// Growing creates a new buffer, copies the old contents into it, and
     /// returns `true` so callers can rebuild bind groups that reference it.
+    /// Fails with an error when the write would exceed `max_capacity`.
     pub fn write(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         offset: u64,
         data: &[u8],
-    ) -> bool {
+    ) -> Result<bool, SynthError> {
         let end = offset + data.len() as u64;
+        if end > self.max_capacity {
+            return Err(SynthError::Gpu(format!(
+                "buffer '{}' write would exceed capacity {} bytes (need {end})",
+                self.label, self.max_capacity
+            )));
+        }
         if end > self.size {
-            let new_size = (self.size * 2).max(end.max(1024));
+            let new_size = (self.size * 2).max(end.max(1024)).min(self.max_capacity);
             let new_buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&self.label),
                 size: new_size,
-                usage: self.usage | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                usage: Self::effective_usage(self.usage),
                 mapped_at_creation: false,
             });
             // Copy old contents (if any) into the new buffer.
-            if self.size > 0 {
+            let can_copy_src = !self.usage.contains(wgpu::BufferUsages::MAP_READ);
+            if self.size > 0 && can_copy_src {
                 let mut encoder =
                     device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
                 encoder.copy_buffer_to_buffer(&self.buffer, 0, &new_buf, 0, self.size);
@@ -129,10 +235,10 @@ impl GrowableBuffer {
             self.buffer = new_buf;
             self.size = new_size;
             queue.write_buffer(&self.buffer, offset, data);
-            return true;
+            return Ok(true);
         }
         queue.write_buffer(&self.buffer, offset, data);
-        false
+        Ok(false)
     }
 
     /// Clears the buffer contents to zero.
@@ -183,40 +289,44 @@ impl GpuResources {
         let device = &ctx.device;
 
         // --- render bind group layout ---
+        // binding 0: voice params, 1..=8: sample chunks, 9: sinc table,
+        // 10: env stages, 11: voice states (rw), 12: voice output (rw).
+        let mut render_entries: Vec<wgpu::BindGroupLayoutEntry> = Vec::with_capacity(13);
+        render_entries.push(bind_entry(
+            0,
+            wgpu::ShaderStages::COMPUTE,
+            wgpu::BufferBindingType::Storage { read_only: true },
+        ));
+        for i in 0..SAMPLES_CHUNKS {
+            render_entries.push(bind_entry(
+                SAMPLES_CHUNK_BINDING_BASE + i as u32,
+                wgpu::ShaderStages::COMPUTE,
+                wgpu::BufferBindingType::Storage { read_only: true },
+            ));
+        }
+        render_entries.push(bind_entry(
+            SINC_BINDING,
+            wgpu::ShaderStages::COMPUTE,
+            wgpu::BufferBindingType::Storage { read_only: true },
+        ));
+        render_entries.push(bind_entry(
+            ENV_BINDING,
+            wgpu::ShaderStages::COMPUTE,
+            wgpu::BufferBindingType::Storage { read_only: true },
+        ));
+        render_entries.push(bind_entry(
+            STATES_BINDING,
+            wgpu::ShaderStages::COMPUTE,
+            wgpu::BufferBindingType::Storage { read_only: false },
+        ));
+        render_entries.push(bind_entry(
+            VOICE_OUT_BINDING,
+            wgpu::ShaderStages::COMPUTE,
+            wgpu::BufferBindingType::Storage { read_only: false },
+        ));
         let render_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("render bind group layout"),
-            entries: &[
-                bind_entry(
-                    0,
-                    wgpu::ShaderStages::COMPUTE,
-                    wgpu::BufferBindingType::Storage { read_only: true },
-                ),
-                bind_entry(
-                    1,
-                    wgpu::ShaderStages::COMPUTE,
-                    wgpu::BufferBindingType::Storage { read_only: true },
-                ),
-                bind_entry(
-                    2,
-                    wgpu::ShaderStages::COMPUTE,
-                    wgpu::BufferBindingType::Storage { read_only: true },
-                ),
-                bind_entry(
-                    3,
-                    wgpu::ShaderStages::COMPUTE,
-                    wgpu::BufferBindingType::Storage { read_only: true },
-                ),
-                bind_entry(
-                    4,
-                    wgpu::ShaderStages::COMPUTE,
-                    wgpu::BufferBindingType::Storage { read_only: false },
-                ),
-                bind_entry(
-                    5,
-                    wgpu::ShaderStages::COMPUTE,
-                    wgpu::BufferBindingType::Storage { read_only: false },
-                ),
-            ],
+            entries: &render_entries,
         });
 
         // --- mix bind group layout ---

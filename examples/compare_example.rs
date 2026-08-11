@@ -1,5 +1,6 @@
 //! Renders `assets/right-example.mid` with `assets/test.sf2` on the GPU and
-//! compares the waveform against the reference `assets/right-example.wav`.
+//! compares the waveform against the reference `assets/ref_xsynth_default.wav`
+//! (rendered with the XSynth offline renderer using its default settings).
 //!
 //! Prints overall correlation / RMS error / peak error plus per-note segment
 //! metrics. The acceptance target is a correlation >= 0.999 and a normalized
@@ -16,22 +17,36 @@ use lumino_gpu_synth::{GpuSynth, SynthConfig};
 
 fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let config = SynthConfig {
+        // Same parameters as the XSynth renderer defaults: envelope curves
+        // attack=Exponential, decay/release=Linear, effects off for the
+        // synthetic comparison.
         use_effects: false,
-        envelope_curves: lumino_gpu_synth::synth::dsp::EnvelopeCurveConfig {
-            attack_curve: lumino_gpu_synth::synth::dsp::CurveKind::Exponential,
-            decay_curve: lumino_gpu_synth::synth::dsp::CurveKind::Exponential,
-            release_curve: lumino_gpu_synth::synth::dsp::CurveKind::Exponential,
-        },
+        max_voices: 16384,
         ..SynthConfig::default()
     };
-    let mut synth = GpuSynth::new(config)?;
-    synth.load_soundfont("assets/test.sf2", 0, 0)?;
 
     println!("rendering...");
-    let result = synth.render_midi_file("assets/right-example.mid")?;
+    // Hard 60 s deadline for the whole render; the process panics if the
+    // GPU render does not finish in time.
+    let result = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut synth = GpuSynth::new(config).expect("gpu synth");
+            synth
+                .load_soundfont("assets/test.sf2", 0, 0)
+                .expect("soundfont");
+            let r = synth.render_midi_file("assets/right-example.mid");
+            let _ = tx.send(r);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => panic!("RENDER TIMED OUT after 60s"),
+        }
+    };
 
     println!("reading reference...");
-    let reference = read_wav("assets/right-example.wav")?;
+    let reference = read_wav("assets/ref_xsynth_default.wav")?;
     println!(
         "reference: {} Hz, {} ch, {:.3} s",
         reference.sample_rate,
@@ -46,15 +61,8 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
         );
     }
 
-    // Per-note segments: notes start at 2.0 s, one every 0.5 s, 0.5 s long.
-    let sr = result.sample_rate;
-    let segments: Vec<(usize, usize)> = (0..5)
-        .map(|i| {
-            let start = ((2.0 + i as f32 * 0.5) * sr as f32) as usize;
-            let end = start + (sr / 2) as usize;
-            (start, end)
-        })
-        .collect();
+    // Whole-file comparison (no fixed note segments for this large MIDI).
+    let segments: Vec<(usize, usize)> = Vec::new();
 
     let report = compare(
         &reference.samples,

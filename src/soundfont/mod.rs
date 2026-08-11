@@ -201,12 +201,35 @@ impl SoundFont {
         if let Some(data) = self.resample_cache.get(&key) {
             return data.clone();
         }
-        let raw = self.samples[id].clone();
-        let native = self.native_rate_for(id);
-        let out: Arc<[f32]> =
-            xsynth_soundfonts::resample::resample_vec(raw.to_vec(), native as f32, new_rate as f32);
+        let out = Self::resample_data(&self.samples[id], self.native_rate_for(id), new_rate);
         self.resample_cache.insert(key, out.clone());
         out
+    }
+
+    /// Computes the resampled data for sample `id` without touching the
+    /// cache (safe to call concurrently from many threads). Use
+    /// [`SoundFont::cache_resampled`] to store the result afterwards.
+    pub fn resample_uncached(&self, id: usize, new_rate: u32) -> Arc<[f32]> {
+        Self::resample_data(&self.samples[id], self.native_rate_for(id), new_rate)
+    }
+
+    /// Returns the cached resample for `id`, or computes it without caching
+    /// when missing (safe to call concurrently; `cache_resampled` can store
+    /// the result afterwards).
+    pub fn resample_read(&self, id: usize, new_rate: u32) -> Arc<[f32]> {
+        if let Some(data) = self.resample_cache.get(&(id, new_rate)) {
+            return data.clone();
+        }
+        Self::resample_data(&self.samples[id], self.native_rate_for(id), new_rate)
+    }
+
+    fn resample_data(raw: &Arc<[f32]>, native: u32, new_rate: u32) -> Arc<[f32]> {
+        xsynth_soundfonts::resample::resample_vec(raw.to_vec(), native as f32, new_rate as f32)
+    }
+
+    /// Stores a previously computed resample in the cache.
+    pub fn cache_resampled(&mut self, id: usize, new_rate: u32, data: Arc<[f32]>) {
+        self.resample_cache.insert((id, new_rate), data);
     }
 
     /// Pre-resamples all samples that a set of zone ids may use. This lets

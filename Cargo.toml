@@ -15,6 +15,7 @@ cpal = "0.18.1"
 pollster = "0.4"
 bytemuck = { version = "1.23", features = ["derive"] }
 thiserror = "2.0"
+rayon = "1.10"
 
 [profile.release]
 opt-level = 3

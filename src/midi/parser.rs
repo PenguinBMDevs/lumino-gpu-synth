@@ -114,31 +114,31 @@ impl MidiFile {
             }
         }
 
-        // Tempo map: for each interval between tempo changes, seconds per tick.
+        // Tempo map with cumulative seconds per segment, so tick -> seconds
+        // is a binary search instead of a scan (large automated files can
+        // contain hundreds of thousands of tempo events; a linear scan per
+        // event would be O(events x tempos) and take minutes).
         // The default tempo is 500_000 us/beat (120 BPM).
-        let mut tempo_map: Vec<(u64, f64)> = Vec::new();
+        let mut tempo_segs: Vec<(u64, f64, f64)> = Vec::with_capacity(tempos.len() + 1);
         let mut prev_tick = 0u64;
         let mut prev_tempo = 500_000.0;
+        let mut cum_secs = 0.0f64;
         for &(tick, us) in tempos.iter() {
-            tempo_map.push((prev_tick, prev_tempo));
+            tempo_segs.push((prev_tick, cum_secs, prev_tempo));
+            cum_secs +=
+                (tick - prev_tick) as f64 * prev_tempo / 1_000_000.0 / ticks_per_beat as f64;
             prev_tick = tick;
             prev_tempo = us as f64;
         }
-        tempo_map.push((prev_tick, prev_tempo));
+        tempo_segs.push((prev_tick, cum_secs, prev_tempo));
 
         let ticks_to_sec = |tick: u64| -> f64 {
-            // Find the tempo segment containing `tick`.
-            let mut sec = 0.0;
-            let mut seg_start_tick = 0u64;
-            for &(start_tick, us) in tempo_map.iter() {
-                if tick <= start_tick {
-                    break;
-                }
-                sec +=
-                    (start_tick - seg_start_tick) as f64 * us / 1_000_000.0 / ticks_per_beat as f64;
-                seg_start_tick = start_tick;
-            }
-            sec + (tick - seg_start_tick) as f64 * prev_tempo / 1_000_000.0 / ticks_per_beat as f64
+            // Last segment whose start tick is <= `tick`.
+            let i = tempo_segs
+                .partition_point(|&(start_tick, _, _)| start_tick <= tick)
+                .saturating_sub(1);
+            let (start_tick, cum, us) = tempo_segs[i];
+            cum + (tick - start_tick) as f64 * us / 1_000_000.0 / ticks_per_beat as f64
         };
 
         let mut events: Vec<TimedEvent> = raw_events
@@ -153,7 +153,12 @@ impl MidiFile {
                 }
             })
             .collect();
-        events.sort_by_key(|e| (e.sample, e.channel));
+        // Stable sort by sample only: events at the same tick keep the
+        // original MIDI order (track order, then per-track order), exactly
+        // like XSynth's merged track iterator. Sorting by channel as well
+        // would reorder same-tick note-on/note-off pairs across tracks and
+        // change note lifetimes relative to the reference.
+        events.sort_by_key(|e| e.sample);
 
         let end_sample = (ticks_to_sec(length_ticks) * sample_rate as f64).round() as u64;
 

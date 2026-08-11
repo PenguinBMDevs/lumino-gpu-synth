@@ -1,3 +1,7 @@
 /target
 *.mid
 *.sf2
+*.old
+*.wav
+*.log
+*.txt

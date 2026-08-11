@@ -49,15 +49,30 @@ pub struct SynthConfig {
 
     /// Maximum number of concurrently active voices.
     ///
-    /// Each MIDI note can spawn one or more voices (one per matching SF2
-    /// region). Voices beyond this limit are killed immediately.
+    /// This is the size of the GPU voice pool (buffers and dispatch width),
+    /// **not** a musical polyphony limit: voices are never killed because
+    /// of it. It must be large enough to hold the peak number of voices the
+    /// MIDI can produce; for pathological files with tens of thousands of
+    /// simultaneous notes, raise it accordingly.
     ///
-    /// Default: `128`.
+    /// Default: `16384`.
     pub max_voices: usize,
+
+    /// Maximum number of simultaneous voices for the *same key* on the same
+    /// channel (XSynth-style per-key polyphony limit).
+    ///
+    /// When a note-on would exceed this, the oldest voice of that key is
+    /// replaced, so a repeated note always steals from its own key rather
+    /// than from unrelated notes. `0` disables the limit entirely.
+    ///
+    /// Default: `4`.
+    pub max_voices_per_key: usize,
 
     /// Number of audio frames rendered per GPU dispatch (per channel).
     ///
-    /// Must be a power of two and at least 16. Default: `512`.
+    /// Must be a power of two and at least 16. Smaller blocks keep the
+    /// per-block voice population (and therefore upload/GPU cost) low for
+    /// dense MIDI; larger blocks amortize dispatch overhead. Default: `1024`.
     pub block_size: usize,
 
     /// Sample interpolation mode used by the GPU render kernel.
@@ -88,19 +103,33 @@ pub struct SynthConfig {
     ///
     /// Default: `0.0001`.
     pub render_silence_threshold: f32,
+
+    /// Maximum number of seconds to keep rendering *after* the last MIDI
+    /// event before aborting with [`crate::SynthError::RenderTimeout`].
+    ///
+    /// This is a safety valve against infinite offline renders caused by
+    /// voices that can never finish (a held damper pedal, a missing note-off
+    /// at the end of the file, a zero-duration envelope stage...). It does
+    /// not limit legitimate files: a normal render ends as soon as the
+    /// output goes silent, which is always well before this budget.
+    ///
+    /// Default: `120.0` seconds.
+    pub max_tail_seconds: f32,
 }
 
 impl Default for SynthConfig {
     fn default() -> Self {
         Self {
             sample_rate: 64_000,
-            max_voices: 128,
+            max_voices: 16_384,
+            max_voices_per_key: 32,
             block_size: 512,
             interpolation: InterpolationMode::Linear,
             use_effects: true,
             envelope_curves: EnvelopeCurveConfig::default(),
             channels: ChannelMode::Stereo,
             render_silence_threshold: 0.0001,
+            max_tail_seconds: 120.0,
         }
     }
 }
@@ -114,9 +143,9 @@ impl SynthConfig {
                 "sample_rate must be non-zero".into(),
             ));
         }
-        if self.max_voices == 0 || self.max_voices > 4096 {
+        if self.max_voices == 0 || self.max_voices > 65536 {
             return Err(crate::SynthError::Config(format!(
-                "max_voices must be within 1..=4096, got {}",
+                "max_voices must be within 1..=65536, got {}",
                 self.max_voices
             )));
         }
@@ -129,6 +158,11 @@ impl SynthConfig {
         if !self.render_silence_threshold.is_finite() || self.render_silence_threshold <= 0.0 {
             return Err(crate::SynthError::Config(
                 "render_silence_threshold must be positive".into(),
+            ));
+        }
+        if !self.max_tail_seconds.is_finite() || self.max_tail_seconds <= 0.0 {
+            return Err(crate::SynthError::Config(
+                "max_tail_seconds must be positive".into(),
             ));
         }
         Ok(())

@@ -679,6 +679,7 @@ dependencies = [
  "cpal",
  "lumino-midly",
  "pollster",
+ "rayon",
  "thiserror 2.0.20",
  "wgpu",
  "xsynth-soundfonts",

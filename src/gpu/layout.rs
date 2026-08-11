@@ -90,6 +90,45 @@ impl EnvStageGpu {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 }
 
+/// One controller event inside a block, applied frame-exactly by the mix
+/// kernel (16 bytes). The kernel replays every event with `frame <= f`
+/// against a per-channel copy of the block-start lerp state, so controller
+/// changes take effect at their exact sample regardless of the block size
+/// and of how many events a block contains.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct MixEvent {
+    /// Frame relative to the block start.
+    pub frame: u32,
+    /// MIDI channel (0-15).
+    pub channel: u32,
+    /// Controller number (7 = volume, 11 = expression, 10/8 = pan).
+    pub cc: u32,
+    /// Controller value normalized to 0..1.
+    pub value: f32,
+}
+
+/// Block-start controller lerp state for one channel (48 bytes, uniform
+/// array element with 16-byte stride).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct MixStart {
+    pub vol: f32,
+    pub vol_step: f32,
+    pub vol_end: f32,
+    pub expr: f32,
+    pub expr_step: f32,
+    pub expr_end: f32,
+    pub pan: f32,
+    pub pan_step: f32,
+    pub pan_end: f32,
+    /// Padding to a 16-byte uniform array element.
+    pub _pad: [f32; 3],
+}
+
+/// Number of MIDI channels in the mix pass.
+pub const MIX_CHANNELS: usize = 16;
+
 /// Mirror of `MixParams` in `mix.wgsl` (uniform buffer, 16-byte padded).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -97,31 +136,16 @@ pub struct MixParams {
     pub voice_count: u32,
     pub block_size: u32,
     pub channel_count: u32,
-    pub reserved: u32,
+    pub event_count: u32,
+    /// `sample_rate * 0.01`: the 10 ms lerp window in samples.
+    pub lerp_len: f32,
+    pub _pad: [f32; 3],
+    /// Per-channel block-start lerp states.
+    pub starts: [MixStart; MIX_CHANNELS],
 }
 
 impl MixParams {
     pub const SIZE: usize = std::mem::size_of::<Self>();
-}
-
-/// Mirror of `ChannelMix` in `mix.wgsl` (per-channel controller curves).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub struct ChannelMix {
-    pub vol_start: f32,
-    pub vol_delta: f32,
-    pub vol_end: f32,
-    pub expr_start: f32,
-    pub expr_delta: f32,
-    pub expr_end: f32,
-    pub pan_start: f32,
-    pub pan_delta: f32,
-    pub pan_end: f32,
-}
-
-impl ChannelMix {
-    pub const SIZE: usize = std::mem::size_of::<Self>();
-    pub const CHANNELS: usize = 16;
 }
 
 impl Default for MixParams {

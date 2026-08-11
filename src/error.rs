@@ -34,6 +34,22 @@ pub enum SynthError {
     /// The number of concurrently active voices exceeded `max_voices`.
     #[error("voice limit exceeded: {0} active voices")]
     VoiceLimit(usize),
+
+    /// Offline rendering exceeded the maximum allowed length. This happens
+    /// when a voice never finishes (e.g. a held damper pedal, a missing
+    /// note-off at the end of the MIDI file, or an envelope stage that
+    /// cannot terminate), which would otherwise loop forever.
+    #[error(
+        "render timed out after {frames} frames: {active_voices} voices still active, last block peak {last_peak}"
+    )]
+    RenderTimeout {
+        /// Frames rendered before the timeout fired.
+        frames: u64,
+        /// Number of voices that were still active at the timeout.
+        active_voices: usize,
+        /// Peak sample magnitude of the last rendered block.
+        last_peak: f32,
+    },
 }
 
 /// Errors that can occur while parsing or preparing a soundfont.
