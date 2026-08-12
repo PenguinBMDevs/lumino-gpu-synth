@@ -252,7 +252,11 @@ fn advance_frame(p: VoiceParams, st: VoiceState, env_value: f32, frame: u32) -> 
 
 // ---------- main ----------
 
-const SEGS: u32 = 1u;
+// Each workgroup (y = SEGS segments) renders one voice; the shader
+// fast-forwards the state to its segment start, so the GPU parallelism is
+// voices x segments. The default below is replaced at pipeline creation
+// with the engine's `RENDER_SEGMENTS` (see `create_render_pipeline`).
+const SEGS: u32 = 16u;
 const SEG_LEN: u32 = BLOCK / SEGS;
 
 @compute
@@ -270,14 +274,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var st = states[voice];
     let out_base = voice * BLOCK * 2u;
     let seg = gid.y;
-    let seg_start = seg * SEG_LEN;
-    let seg_end = min(seg_start + SEG_LEN, BLOCK);
-
     // Filtered voices (use_effects = true) have signal-dependent biquad
     // state that cannot be fast-forwarded, so they run single-segment:
     // segment 0 renders the whole block, the other segments just zero their
     // output range.
     let is_filtered = p.filter_on != 0u;
+    let seg_start = select(seg * SEG_LEN, 0u, is_filtered);
+    let seg_end = select(min(seg_start + SEG_LEN, BLOCK), BLOCK, is_filtered);
     if (is_filtered && seg > 0u) {
         var z = seg_start;
         while (z < seg_end) {

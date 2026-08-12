@@ -17,14 +17,14 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let mut synth = GpuSynth::new(SynthConfig::default())?;
     synth.load_soundfont("assets/test.sf2", 0, 0)?;
     for ev in &midi.sequence.events {
-        if ev.sample >= cutoff {
+        if (ev.sample as u64) >= cutoff {
             break;
         }
-        match ev.event {
-            MidiEvent::NoteOn { key, vel } => synth.note_on(ev.channel, key, vel),
-            MidiEvent::NoteOff { key } => synth.note_off(ev.channel, key),
+        match ev.event() {
+            MidiEvent::NoteOn { key, vel } => synth.note_on(ev.channel(), key, vel),
+            MidiEvent::NoteOff { key } => synth.note_off(ev.channel(), key),
             MidiEvent::ControlChange { controller, value } => {
-                synth.control_change(ev.channel, controller, value)
+                synth.control_change(ev.channel(), controller, value)
             }
             _ => {}
         }

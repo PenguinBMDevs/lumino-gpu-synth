@@ -15,7 +15,9 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let sr = 48_000u32;
     let midi = MidiFile::load(&path, sr)?;
     let evs = &midi.sequence.events;
-    let dur = evs.last().map_or(0.0, |e| e.sample as f64 / sr as f64);
+    let dur = evs
+        .last()
+        .map_or(0.0, |e| e.sample as u64 as f64 / sr as f64);
     println!(
         "events: {}  duration: {:.2}s  ev/s: {:.0}",
         evs.len(),
@@ -31,11 +33,11 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let mut note_cc: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
     let mut per_chan = [0u64; 16];
     for e in evs {
-        per_chan[(e.channel as usize) % 16] += 1;
-        match e.event {
+        per_chan[(e.channel() as usize) % 16] += 1;
+        match e.event() {
             MidiEvent::NoteOn { .. } => {
                 notes += 1;
-                *note_cc.entry(e.channel).or_default() += 1;
+                *note_cc.entry(e.channel()).or_default() += 1;
             }
             MidiEvent::NoteOff { .. } => offs += 1,
             MidiEvent::ControlChange { .. } => ccs += 1,
@@ -58,8 +60,8 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let buckets = dur as usize + 1;
     let mut active = vec![0i64; buckets.max(1)];
     for e in evs {
-        let b = (e.sample as f64 / sr as f64) as usize;
-        match e.event {
+        let b = (e.sample as u64 as f64 / sr as f64) as usize;
+        match e.event() {
             MidiEvent::NoteOn { .. } if b < buckets => active[b] += 1,
             MidiEvent::NoteOff { .. } if b < buckets => active[b] -= 1,
             _ => {}

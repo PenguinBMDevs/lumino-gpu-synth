@@ -216,19 +216,65 @@ pub struct GpuSynth {
     /// voices by id, and reusing ids (e.g. the array position) would apply a
     /// stale state to the wrong voice and roll its envelope back.
     voice_id_counter: u32,
+    /// Per-(channel, key) note-on budget for the current block. Black-MIDI
+    /// peaks push tens of thousands of note-ons per key per block, of which
+    /// only `max_voices_per_key` can survive the per-key trim - the rest are
+    /// processing wasted on notes that produce no audible output. Once a
+    /// key's budget is spent, further note-ons are skipped entirely. A flat
+    /// array (16 channels x 128 keys) keeps the skip path a single indexed
+    /// load - the HashMap version cost ~0.15us per skipped note-on.
+    spawn_budget: [u8; 16 * 128],
+    /// Per-(channel, key) count of active (not ended, not released) note
+    /// groups, so `release_key` can bail out in O(1) when a note-off has no
+    /// target - black-MIDI peaks fire hundreds of thousands of orphan
+    /// note-offs per block whose keys have no live notes left. Rebuilt
+    /// exactly once per block in `upload_voices`; in-block spawns/releases
+    /// adjust it, trims may leave it slightly stale (only costs a scan).
+    active_notes: [u8; 16 * 128],
+    /// Voice template cache: `(key, vel, channel, pitch_mult_bits,
+    /// env_attack, env_release)` -> pre-built voices for every zone of that
+    /// note. Black-MIDI note storms spawn thousands of identical notes per
+    /// block; cloning a template skips the soundfont zone lookup and the
+    /// per-zone envelope-stage computation (the dominant CPU cost of
+    /// `spawn_voices`).
+    voice_templates: VoiceTemplateCache,
     /// Voice states are only read back every `STATES_SYNC_EVERY` blocks:
     /// a voice ending late does not change any audio sample, and skipping
     /// the extra map/poll round trip per block is a large CPU win.
     states_sync_counter: u32,
-    /// Submission index of the previously dispatched block; the CPU waits
-    /// for this one (not the current) so GPU work pipelines with CPU work.
-    prev_submission: Option<wgpu::SubmissionIndex>,
+    /// One-block CPU/GPU pipeline state: the submission dispatched by the
+    /// most recent `render_block`, plus the exact double-buffer slots its
+    /// output and voice states were copied into. The NEXT `render_block`
+    /// consumes it (`collect_pending_readback`) at its start, so the GPU
+    /// renders block N while the CPU maps block N-1's audio back - the
+    /// per-block synchronous poll wait disappears. Recording the exact
+    /// slots (instead of a separate "previous submission" marker) keeps the
+    /// readback window correct even when silent blocks skip dispatching.
+    pending: Option<PendingReadback>,
     /// Persistent staging belt: reuses staging buffers across blocks so the
     /// per-block `queue.write_buffer` (which allocates + copies a fresh
     /// staging buffer every call) stops dominating the render time. Measured
     /// 35ms/block for ~400KB of voice uploads vs ~2ms with a belt.
     belt: wgpu::util::StagingBelt,
 }
+
+/// A submission whose readback is still outstanding (see `GpuSynth::pending`).
+struct PendingReadback {
+    idx: wgpu::SubmissionIndex,
+    /// `out_readback` slot the block's audio was copied to.
+    out_slot: usize,
+    /// `states_readback` slot the block's voice states were copied to.
+    states_slot: usize,
+}
+
+/// Cache key for one note's voice templates (see `GpuSynth::voice_templates`).
+type VoiceTemplateKey = (u8, u8, u8, u32, u8, u8);
+/// Pre-built voices per note, keyed by (key, vel, channel, pitch_mult_bits,
+/// env_attack, env_release).
+type VoiceTemplateCache = std::collections::HashMap<VoiceTemplateKey, Vec<Voice>>;
+
+/// Per-voice diagnostic row from [`GpuSynth::debug_voices`].
+type VoiceDebugInfo = (u8, u8, f32, f32, bool, bool, u32, u32, u64, u32, f32);
 
 impl GpuSynth {
     /// Creates a new synthesizer with the given configuration, initializing
@@ -405,8 +451,11 @@ impl GpuSynth {
             upload_chans: Vec::new(),
             note_counter: 0,
             voice_id_counter: 0,
+            spawn_budget: [0; 16 * 128],
+            active_notes: [0; 16 * 128],
+            voice_templates: std::collections::HashMap::new(),
             states_sync_counter: 0,
-            prev_submission: None,
+            pending: None,
             belt: wgpu::util::StagingBelt::new(1 << 20),
         };
         engine.rebuild_bind_groups();
@@ -480,7 +529,7 @@ impl GpuSynth {
     /// Diagnostics: per-voice `(key, vel, speed, amp, released, ended,
     /// env_stage, env_t, release_at, gpu_is_released, env_from)`.
     #[doc(hidden)]
-    pub fn debug_voices(&self) -> Vec<(u8, u8, f32, f32, bool, bool, u32, u32, u64, u32, f32)> {
+    pub fn debug_voices(&self) -> Vec<VoiceDebugInfo> {
         self.voices
             .iter()
             .map(|v| {
@@ -512,11 +561,11 @@ impl GpuSynth {
 
     /// Queues a MIDI event (applied at the next block boundary).
     pub fn send_event(&mut self, channel: u8, event: MidiEvent) {
-        self.pending_events.push_back(TimedEvent {
-            sample: self.global_frame,
-            channel: channel.min(15),
+        self.pending_events.push_back(TimedEvent::from_event(
+            self.global_frame as u32,
+            channel.min(15),
             event,
-        });
+        ));
     }
 
     /// Loads a full sample-accurate event stream for realtime playback.
@@ -579,19 +628,40 @@ impl GpuSynth {
         self.apply_events(base, base + block as u64)?;
         let t1 = std::time::Instant::now();
 
+        // One-block pipeline: consume the previous block's readback BEFORE
+        // the fast-path check, because a silent block still owes the
+        // listener the previous block's audio (the GPU rendered it while we
+        // prepared this block). The pending submission has had a full block
+        // of CPU work to finish, so the poll returns immediately.
+        self.collect_pending_readback()?;
+        let t1b = std::time::Instant::now();
+
         // Fast path: no voices at all - the block is pure silence (the mix
         // pass would sum nothing). Advance the controller states so CC
-        // smoothing stays continuous and skip the whole GPU round trip.
-        // Dense-but-sparse MIDI spends a large fraction of its timeline in
-        // note gaps, so this is a significant win.
+        // smoothing stays continuous and skip the GPU round trip. Dense-
+        // but-sparse MIDI spends a large fraction of its timeline in note
+        // gaps, so this is a significant win.
+        //
+        // We did NOT dispatch this block, so the GPU state did not advance
+        // and this block's own audio is silence; the output owed to the
+        // listener is the audio of the last DISPATCHED block, collected
+        // above - exactly one block old, which is this block's turn to play.
+        // With nothing pending (two consecutive silent blocks) it is
+        // silence. `last_states`/`prev_voice_ids` are left intact: they are
+        // the resume state of the last dispatch, still valid because the GPU
+        // state did not move.
         if self.voices.is_empty() {
             self.update_mix_params(base)?;
-            out[..block * chs].fill(0.0);
+            if let Some(data) = self.last_out.take() {
+                let count = (data.len() / 4).min(block * chs);
+                out[..count].copy_from_slice(bytemuck::cast_slice(&data[..count * 4]));
+                if count < block * chs {
+                    out[count..block * chs].fill(0.0);
+                }
+            } else {
+                out[..block * chs].fill(0.0);
+            }
             self.global_frame += block as u64;
-            // No GPU work happened; drop any stale read-back states so a
-            // later block cannot resume from a mismatched voice list.
-            self.last_states = None;
-            self.prev_voice_ids.clear();
             if prof {
                 eprintln!(
                     "[profile] block {}: silent skip",
@@ -601,6 +671,16 @@ impl GpuSynth {
             return Ok(());
         }
 
+        // States from the same readback: apply the previous block's GPU
+        // state to the CPU mirror BEFORE uploading this block's parameters,
+        // so `upload_voices` (a) prunes voices that ended on the GPU and
+        // (b) has a fresh `v.state` fallback when a voice is not present in
+        // the read-back list. `sync_voice_states` does not consume
+        // `prev_voice_ids` - that list must stay aligned with `last_states`
+        // for `upload_voices`' resume matching.
+        self.sync_voice_states();
+        let t1c = std::time::Instant::now();
+
         self.upload_voices(base)?;
         let t2 = std::time::Instant::now();
         self.upload_new_samples()?;
@@ -609,24 +689,24 @@ impl GpuSynth {
         let t4 = std::time::Instant::now();
         self.dispatch(base)?;
         let t5 = std::time::Instant::now();
+        // The output owed this block is the audio collected at its start
+        // (the previous block's render).
         self.readback(out)?;
         let t6 = std::time::Instant::now();
-        // States are read back every block (STATES_SYNC_EVERY = 1 keeps the
-        // counter at 0, so every dispatch maps them); apply the readback
-        // unconditionally. sync_voice_states is a no-op when no states are
-        // pending, which keeps this correct if the cadence is ever changed.
-        self.sync_voice_states();
 
         if prof && self.global_frame.is_multiple_of(block as u64 * 25) {
             let block_no = self.global_frame / block as u64;
             eprintln!(
-                "[profile] block {block_no}: apply={}us upload={}us samples={}us mix={}us dispatch={}us readback={}us voices={}",
+                "[profile] block {block_no}: apply={}us collect={}us sync={}us upload={}us samples={}us mix={}us dispatch={}us readback={}us total={}us voices={}",
                 (t1 - t0).as_micros(),
-                (t2 - t1).as_micros(),
+                (t1b - t1).as_micros(),
+                (t1c - t1b).as_micros(),
+                (t2 - t1c).as_micros(),
                 (t3 - t2).as_micros(),
                 (t4 - t3).as_micros(),
                 (t5 - t4).as_micros(),
                 (t6 - t5).as_micros(),
+                (t6 - t0).as_micros(),
                 self.voices.len()
             );
         }
@@ -673,28 +753,26 @@ impl GpuSynth {
 
         // Borrow sf to build one minimal voice.
         let mut buf = vec![0.0f32; self.config.block_size * self.output_channels()];
-        if let Some(sf) = self.sf.as_ref() {
-            let zone_ids = sf.zones_at(60, 100);
-            if let Some(&zid) = zone_ids.first() {
-                if let Some(mut v) = build_voice(
-                    sf,
-                    zid,
-                    60,
-                    100,
-                    0,
-                    0,
-                    self.config.sample_rate,
-                    1.0,
-                    None,
-                    None,
-                    self.config.envelope_curves,
-                ) {
-                    v.amp = 0.0; // silent
-                    v.id = self.voice_id_counter;
-                    self.voice_id_counter += 1;
-                    self.voices.push(v);
-                }
-            }
+        if let Some(sf) = self.sf.as_ref()
+            && let Some(&zid) = sf.zones_at(60, 100).first()
+            && let Some(mut v) = build_voice(
+                sf,
+                zid,
+                60,
+                100,
+                0,
+                0,
+                self.config.sample_rate,
+                1.0,
+                None,
+                None,
+                self.config.envelope_curves,
+            )
+        {
+            v.amp = 0.0; // silent
+            v.id = self.voice_id_counter;
+            self.voice_id_counter += 1;
+            self.voices.push(v);
         }
         if self.voices.is_empty() {
             // No soundfont/zone; nothing to warm. Restore and return.
@@ -725,6 +803,60 @@ impl GpuSynth {
         Ok(())
     }
 
+    /// Pre-builds the voice template cache for every (key, vel, channel)
+    /// the MIDI uses, so the first dense blocks of realtime playback do not
+    /// pay the per-note zone lookup + envelope build cost (which can spike
+    /// the render load of the opening blocks of black-MIDI).
+    fn warm_voice_templates(&mut self, events: &[TimedEvent]) {
+        let Some(sf) = self.sf.as_ref() else {
+            return;
+        };
+        let rate = self.config.sample_rate;
+        let curves = self.config.envelope_curves;
+        // Bitmap over the (channel x key x vel) grid: the HashMap lookup per
+        // event cost ~50ns x 200M events on black-MIDI; this is O(1) array
+        // indexing. Templates are built for the DEFAULT channel state only
+        // (pitch 1.0, no env CC) - notes with bends or CC72/73 fall back to
+        // building on demand.
+        let mut seen: Vec<u8> = vec![0; 16 * 128 * 128];
+        for ev in events {
+            let MidiEvent::NoteOn { key, vel } = ev.event() else {
+                continue;
+            };
+            let slot =
+                &mut seen[ev.channel() as usize * 128 * 128 + key as usize * 128 + vel as usize];
+            if *slot != 0 {
+                continue;
+            }
+            *slot = 1;
+            let tmpl_key = (key, vel, ev.channel(), 1.0f32.to_bits(), 0xFF, 0xFF);
+            if self.voice_templates.contains_key(&tmpl_key) {
+                continue;
+            }
+            let mut built: Vec<Voice> = Vec::new();
+            for &zid in sf.zones_at(key, vel) {
+                if let Some(v) = build_voice(
+                    sf,
+                    zid,
+                    key,
+                    vel,
+                    ev.channel(),
+                    0,
+                    rate,
+                    1.0,
+                    None,
+                    None,
+                    curves,
+                ) {
+                    built.push(v);
+                }
+            }
+            if !built.is_empty() {
+                self.voice_templates.insert(tmpl_key, built);
+            }
+        }
+    }
+
     /// Pre-warms the GPU sample cache with every sample the MIDI file will
     /// use (resampled and uploaded up front).
     ///
@@ -741,17 +873,31 @@ impl GpuSynth {
         &mut self,
         midi_path: impl AsRef<std::path::Path>,
     ) -> Result<(), SynthError> {
+        let t0 = std::time::Instant::now();
         let midi = MidiFile::load(midi_path, self.config.sample_rate)?;
         let events = &midi.sequence.events;
         if let Some(sf) = self.sf.as_ref() {
+            // One pass over the (possibly 100M+ event) stream. Black-MIDI
+            // repeats the same (key, vel) millions of times, so a bitmap of
+            // the 128x128 key/velocity grid skips `zones_at` for repeats -
+            // the previous version called `zones_at` per event (100M+ calls)
+            // and scanned the stream TWICE (samples + templates), which is
+            // why prewarming "Rekt Apple!!.mid" took 90+ seconds.
+            let mut seen: Vec<u8> = vec![0; 128 * 128];
             let mut wanted: Vec<usize> = Vec::new();
             for ev in events {
-                if let MidiEvent::NoteOn { key, vel } = ev.event {
-                    for &zid in sf.zones_at(key, vel) {
-                        let zone = sf.zone(zid);
-                        wanted.push(zone.sample_id);
-                        wanted.push(zone.sample_id_r);
-                    }
+                let MidiEvent::NoteOn { key, vel } = ev.event() else {
+                    continue;
+                };
+                let slot = &mut seen[key as usize * 128 + vel as usize];
+                if *slot != 0 {
+                    continue;
+                }
+                *slot = 1;
+                for &zid in sf.zones_at(key, vel) {
+                    let zone = sf.zone(zid);
+                    wanted.push(zone.sample_id);
+                    wanted.push(zone.sample_id_r);
                 }
             }
             wanted.sort_unstable();
@@ -786,6 +932,17 @@ impl GpuSynth {
         // Warm the GPU pipelines so the first realtime block does not pay a
         // multi-hundred-ms cold start (which would empty the audio queue).
         self.warm_gpu()?;
+        // Pre-build voice templates so the opening blocks do not pay the
+        // per-note build cost either.
+        self.warm_voice_templates(events);
+        let t1 = std::time::Instant::now();
+        if std::env::var("LUMINO_PROFILE").is_ok() {
+            eprintln!(
+                "[prewarm] load+scan+upload: {:.1}s, templates: {:.1}s",
+                (t1 - t0).as_secs_f64(),
+                t1.elapsed().as_secs_f64()
+            );
+        }
         Ok(())
     }
 
@@ -817,6 +974,7 @@ impl GpuSynth {
         self.last_states = None;
         self.last_out = None;
         self.prev_voice_ids.clear();
+        self.pending = None;
 
         let prof = std::env::var("LUMINO_PROFILE").is_ok();
         let t0 = std::time::Instant::now();
@@ -831,7 +989,7 @@ impl GpuSynth {
         if let Some(sf) = self.sf.as_ref() {
             let mut wanted: Vec<usize> = Vec::new();
             for ev in &self.offline_events {
-                if let MidiEvent::NoteOn { key, vel } = ev.event {
+                if let MidiEvent::NoteOn { key, vel } = ev.event() {
                     for &zid in sf.zones_at(key, vel) {
                         let zone = sf.zone(zid);
                         wanted.push(zone.sample_id);
@@ -875,7 +1033,7 @@ impl GpuSynth {
         // would otherwise loop forever. Abort once the last event is behind
         // us by `max_tail_seconds`; the hard cap keeps the guard well inside
         // the u32 frame range used by the GPU parameters.
-        let events_end = self.offline_events.last().map_or(0, |e| e.sample);
+        let events_end = self.offline_events.last().map_or(0, |e| e.sample as u64);
         let tail_budget =
             (self.config.max_tail_seconds as f64 * self.config.sample_rate as f64) as u64;
         let max_frames = match limit_frames {
@@ -897,10 +1055,26 @@ impl GpuSynth {
         // last event, so the bar is allowed to exceed 100% there.
         let mut progress = ProgressBar::new(max_frames, self.config.show_progress);
 
+        // The one-block pipeline makes every `render_block` output the audio
+        // of the PREVIOUS dispatched block. The very first block therefore
+        // emits the fake "-1" audio (silence, nothing was dispatched before
+        // it) which must not enter the sample stream; block 0's real audio
+        // arrives with block 1.
+        let mut first_block = true;
+
         // Phase 1: process all events and render until no voices remain. If
         // the events are exhausted and the block went silent, we stop even
         // when voices linger (they are stuck in sustain and contribute
         // nothing; the tail below would be silent too).
+        //
+        // NOTE on the appending order: with the one-block pipeline every
+        // `render_block` outputs the audio of the block it dispatched
+        // PREVIOUSLY, so the frame range of `block_buf` lags `global_frame`
+        // by one block. Appending must therefore happen BEFORE the
+        // `max_frames` check - the block being appended is the one that
+        // just crossed (or reached) the limit, i.e. the last in-limit
+        // audio. Checking first would drop it and let the drain append an
+        // out-of-limit block instead, shifting the whole tail by one block.
         loop {
             let events_done = self.offline_cursor >= self.offline_events.len();
             if events_done && self.voices.is_empty() {
@@ -912,9 +1086,21 @@ impl GpuSynth {
                 }
                 break;
             }
+            let rb_t0 = std::time::Instant::now();
             self.render_block(&mut block_buf)?;
+            let rb_dt = rb_t0.elapsed();
             progress.tick(self.global_frame);
             let silent = block_buf.iter().all(|s| s.abs() <= threshold);
+            if rb_dt.as_millis() > 30 {
+                eprintln!(
+                    "[slow-block] frame={} render={:?} silent={} cursor={} voices={}",
+                    self.global_frame,
+                    rb_dt,
+                    silent,
+                    self.offline_cursor,
+                    self.voices.len()
+                );
+            }
             if events_done && silent {
                 if prof {
                     eprintln!(
@@ -926,13 +1112,16 @@ impl GpuSynth {
                 }
                 break;
             }
+            if !first_block {
+                samples.extend_from_slice(&block_buf);
+            }
+            first_block = false;
             if self.global_frame >= max_frames {
                 if limited {
                     break;
                 }
                 return Err(self.render_timeout(&block_buf));
             }
-            samples.extend_from_slice(&block_buf);
         }
 
         // Phase 2: decay tail - render blocks until one is entirely silent.
@@ -940,11 +1129,22 @@ impl GpuSynth {
             self.render_block(&mut block_buf)?;
             progress.tick(self.global_frame);
             let silent = block_buf.iter().all(|s| s.abs() <= threshold);
-            if silent || (limited && self.global_frame >= max_frames) {
+            if silent {
                 break;
             }
             if self.global_frame >= max_frames {
-                return Err(self.render_timeout(&block_buf));
+                if !limited {
+                    return Err(self.render_timeout(&block_buf));
+                }
+                // Frame-limited: this output is the audio of the block that
+                // crossed the limit (one block behind `global_frame`);
+                // append it only if it still starts inside the limit, then
+                // stop - rendering any further would only produce
+                // out-of-limit audio.
+                if (self.global_frame - block as u64) < max_frames {
+                    samples.extend_from_slice(&block_buf);
+                }
+                break;
             }
             samples.extend_from_slice(&block_buf);
         }
@@ -1008,7 +1208,7 @@ impl GpuSynth {
         // Offline event stream (events with sample < end belong to this block).
         while self.offline_cursor < self.offline_events.len() {
             let ev = self.offline_events[self.offline_cursor];
-            if ev.sample >= end {
+            if ev.sample as u64 >= end {
                 break;
             }
             self.offline_cursor += 1;
@@ -1018,27 +1218,44 @@ impl GpuSynth {
     }
 
     fn handle_event(&mut self, ev: TimedEvent) -> Result<(), SynthError> {
-        let ch = ev.channel as usize;
-        match ev.event {
+        let ch = ev.channel() as usize;
+        match ev.event() {
             MidiEvent::NoteOn { key, vel } => {
                 // Velocity 0 is converted to a note-off by the parser; a
                 // velocity of 1 is a barely-audible note that XSynth does
                 // not render. Dropping it saves a voice slot without any
                 // audible change.
                 if vel <= 1 {
-                    Ok(())
-                } else {
-                    self.spawn_voices(ch, key, vel, ev.sample)
+                    return Ok(());
                 }
+                // Per-key note-on budget, checked HERE (not inside
+                // `spawn_voices`) so black-MIDI overflow notes skip the
+                // function call entirely - the peaks fire hundreds of
+                // thousands of note-ons per block, of which only
+                // `max_voices_per_key` can survive the per-key trim.
+                let limit = self.config.max_voices_per_key;
+                if limit > 0 {
+                    const BUDGET_MULT: u8 = 4;
+                    let slot = &mut self.spawn_budget[ch * 128 + key as usize];
+                    if *slot >= (limit as u8).saturating_mul(BUDGET_MULT) {
+                        return Ok(());
+                    }
+                    *slot += 1;
+                }
+                self.spawn_voices(ch, key, vel, ev.sample as u64)
             }
-            MidiEvent::NoteOff { key } => self.release_key(ch, key, ev.sample),
+            MidiEvent::NoteOff { key } => self.release_key(ch, key, ev.sample as u64),
             MidiEvent::ControlChange { controller, value } => {
                 match controller {
                     // Channel mix controllers: deferred for frame-exact
                     // application at the mix stage.
                     0x07 | 0x0B | 0x0A | 0x08 => {
-                        self.pending_mix_events
-                            .push((ev.sample, ch as u8, controller, value));
+                        self.pending_mix_events.push((
+                            ev.sample as u64,
+                            ch as u8,
+                            controller,
+                            value,
+                        ));
                     }
                     _ => self.apply_cc(ch, controller, value),
                 }
@@ -1068,6 +1285,14 @@ impl GpuSynth {
     }
 
     fn release_key(&mut self, ch: usize, key: u8, at: u64) -> Result<(), SynthError> {
+        // O(1) bail-out for orphan note-offs (no active note group on this
+        // key): black-MIDI peaks fire hundreds of thousands of these per
+        // block and the key scan below would dominate the block time.
+        if std::env::var("LUMINO_NO_ACTIVE").is_err()
+            && self.active_notes[ch * 128 + key as usize] == 0
+        {
+            return Ok(());
+        }
         let damper = self.channels[ch].damper;
         // Indexed by (channel, key): only the voices of this key are touched.
         //
@@ -1091,15 +1316,24 @@ impl GpuSynth {
                 break;
             }
             if let Some(nid) = note_id {
+                let mut released_any = false;
                 for &pos in positions {
                     if let Some(v) = self.voices.get_mut(pos)
                         && v.note_id == nid
                         && !damper
                     {
                         v.release_at = at;
+                        released_any = true;
                     }
                     // When the damper is down, the voice stays sustained
                     // until the damper is lifted (release_at stays MAX).
+                }
+                if released_any {
+                    // The whole note group is now releasing; decrement the
+                    // active-note count (never below 0 - trims may have
+                    // stale-counted).
+                    let slot = &mut self.active_notes[ch * 128 + key as usize];
+                    *slot = slot.saturating_sub(1);
                 }
             }
         }
@@ -1107,40 +1341,71 @@ impl GpuSynth {
     }
 
     fn spawn_voices(&mut self, ch: usize, key: u8, vel: u8, at: u64) -> Result<(), SynthError> {
+        // The per-key note-on budget is enforced in `handle_event` before
+        // this call (see `MidiEvent::NoteOn`), so this path only runs for
+        // notes that may actually be heard.
         let sf = self.sf.as_ref().ok_or_else(|| {
             SynthError::Config("no soundfont loaded; call load_soundfont first".into())
         })?;
-        let zone_ids = sf.zones_at(key, vel).to_vec();
-        if zone_ids.is_empty() {
-            return Ok(());
-        }
-        let zone_count = zone_ids.len();
         let pitch_mult = self.channels[ch].pitch_multiplier;
-
-        // Build every zone voice of this note up front so that polyphony
-        // management (exclusive class + per-key stealing) runs *once per
-        // note* instead of once per zone. The old code ran the steal logic
-        // inside the zone loop, so the second zone of a stereo pair could
-        // steal the first zone's voice pushed milliseconds earlier - the
-        // cause of dropped notes on dense repeated single keys.
-        let mut built: Vec<Voice> = Vec::with_capacity(zone_count);
-        for zone_id in zone_ids {
-            if let Some(v) = build_voice(
-                sf,
-                zone_id,
-                key,
-                vel,
-                ch as u8,
-                at,
-                self.config.sample_rate,
-                pitch_mult,
-                self.channels[ch].env_attack,
-                self.channels[ch].env_release,
-                self.config.envelope_curves,
-            ) {
-                built.push(v);
+        // Envelope-modifier CC values also shape the template (attack/release
+        // re-parameterization happens at build time).
+        let env_attack = self.channels[ch].env_attack;
+        let env_release = self.channels[ch].env_release;
+        let tmpl_key = (
+            key,
+            vel,
+            ch as u8,
+            pitch_mult.to_bits(),
+            env_attack.unwrap_or(0xFF),
+            env_release.unwrap_or(0xFF),
+        );
+        // Build (or reuse) the voices for this note. Template hits are the
+        // hot path on black-MIDI note storms: identical notes repeat
+        // thousands of times per block, and cloning skips the zone lookup +
+        // envelope computation entirely. Templates are immutable; the
+        // per-note fields (id, note_id, start_at, state, release) are reset
+        // on clone below.
+        let built: Vec<Voice> = if let Some(tmpls) = self.voice_templates.get(&tmpl_key) {
+            tmpls
+                .iter()
+                .map(|t| {
+                    let mut v = t.clone();
+                    v.id = 0;
+                    v.note_id = 0;
+                    v.state = VoiceState::default();
+                    v.release_at = u64::MAX;
+                    v.released = false;
+                    v.start_at = at;
+                    v.sample_offset_r = 0;
+                    v
+                })
+                .collect()
+        } else {
+            let zone_ids = sf.zones_at(key, vel).to_vec();
+            let mut built: Vec<Voice> = Vec::with_capacity(zone_ids.len());
+            for zone_id in zone_ids {
+                if let Some(v) = build_voice(
+                    sf,
+                    zone_id,
+                    key,
+                    vel,
+                    ch as u8,
+                    at,
+                    self.config.sample_rate,
+                    pitch_mult,
+                    env_attack,
+                    env_release,
+                    self.config.envelope_curves,
+                ) {
+                    built.push(v);
+                }
             }
-        }
+            if !built.is_empty() {
+                self.voice_templates.insert(tmpl_key, built.clone());
+            }
+            built
+        };
         if built.is_empty() {
             return Ok(());
         }
@@ -1148,97 +1413,11 @@ impl GpuSynth {
         self.note_counter += 1;
         let note_id = self.note_counter;
 
-        // Exclusive class: kill previous voices with the same class and
-        // rebuild the per-key index. One class check per note (the zones of
-        // a note share their class).
-        if let Some(class) = built.iter().find_map(|v| v.exclusive_class) {
-            self.voices.retain(|v| v.exclusive_class != Some(class));
-            self.rebuild_key_voices();
-        }
-
-        // XSynth-style per-key polyphony limit: a new note-on may only
-        // steal from the voices of the *same key* on this channel, keeping
-        // at most `max_voices_per_key` layers per key (counting all zones).
-        // There is no global voice cap - dense MIDI never drops unrelated
-        // notes.
-        //
-        // Mirror XSynth's `pop_quietest_voice_group`: steal the *quietest*
-        // voices of the key (smallest velocity), not the oldest. Killing a
-        // barely-audible layer produces no audible click and preserves the
-        // loud melodic line, so repeated notes sound like XSynth instead of
-        // a chopped, clicky mess.
-        //
-        // XSynth steals whole note *groups* (all zones spawned by one
-        // note-on), so a stereo pair is never split. We do the same: voices
-        // of one note share `note_id` and are killed together.
-        //
-        // The stolen voices end *immediately* (no release tail): the layer
-        // limit counts voices of the key, so a repeated note replaces its
-        // own predecessors instead of stacking inaudible release tails.
-        // This keeps the voice pool bounded by `keys x max_voices_per_key`
-        // even for pathological note densities.
-        //
-        // Voices already marked `ended` (killed by a previous steal, still
-        // in the array until the next block upload) occupy a slot without
-        // any audible content - they are released for free first, so the
-        // quota only counts voices that can actually be heard.
-        let limit = self.config.max_voices_per_key;
-        if limit > 0 {
-            let mut kept: VecDeque<usize> = VecDeque::new();
-            let mut killed = 0usize;
-            if let Some(positions) = self.key_voices.get(&(ch as u8, key)) {
-                // Group consecutive same-note voices (spawn order keeps one
-                // note's zones adjacent); ended voices are freed first.
-                let mut groups: Vec<(u8, Vec<usize>)> = Vec::new();
-                let mut stale: Vec<usize> = Vec::new();
-                for &pos in positions {
-                    let Some(v) = self.voices.get(pos) else {
-                        continue;
-                    };
-                    if v.state.ended != 0 {
-                        stale.push(pos);
-                        continue;
-                    }
-                    let (vel, note) = (v.vel, v.note_id);
-                    match groups.last_mut() {
-                        Some((_, g)) if self.voices[g[0]].note_id == note => g.push(pos),
-                        _ => groups.push((vel, vec![pos])),
-                    }
-                }
-                // Free already-ended voices for free, then kill whole
-                // quietest groups until the new note (zone_count voices)
-                // keeps the key at or under `limit`.
-                let active = groups.iter().map(|(_, g)| g.len()).sum::<usize>();
-                let need_free = active.saturating_sub(limit.saturating_sub(zone_count));
-                groups.sort_by_key(|&(vel, _)| vel);
-                let mut freed = 0usize;
-                let mut kill_groups = 0usize;
-                for (_, g) in &groups {
-                    if freed >= need_free {
-                        break;
-                    }
-                    freed += g.len();
-                    kill_groups += 1;
-                }
-                let mut kill_set: Vec<usize> = Vec::new();
-                for (_, g) in groups.iter().take(kill_groups) {
-                    kill_set.extend(g.iter().copied());
-                }
-                for &pos in positions {
-                    if kill_set.contains(&pos) || stale.contains(&pos) {
-                        if let Some(v) = self.voices.get_mut(pos) {
-                            v.state.ended = 1;
-                            killed += 1;
-                        }
-                    } else {
-                        kept.push_back(pos);
-                    }
-                }
-            }
-            if killed > 0 {
-                self.key_voices.insert((ch as u8, key), kept);
-            }
-        }
+        // Exclusive class: the newest note of a class kills the older ones.
+        // This used to scan the whole voice pool per note-on (O(voices) per
+        // event - hundreds of ms per block on black-MIDI storms); it now
+        // runs once per block in `upload_voices` (see `trim_exclusive`).
+        let _ = built.iter().find_map(|v| v.exclusive_class);
 
         for mut voice in built {
             voice.id = self.voice_id_counter;
@@ -1250,6 +1429,22 @@ impl GpuSynth {
                 .entry((ch as u8, key))
                 .or_default()
                 .push_back(pos);
+        }
+        // One more active note group for this key (release_key decrements).
+        let slot = &mut self.active_notes[ch * 128 + key as usize];
+        *slot = slot.saturating_add(1);
+        // In-block light trim: when a key's list exceeds twice its cap,
+        // compact it right away. Deferring the whole trim to the block end
+        // lets the list grow to tens of thousands of voices on black-MIDI
+        // note storms, which makes every in-block release_key scan O(10k).
+        let limit = self.config.max_voices_per_key;
+        if limit > 0
+            && self
+                .key_voices
+                .get(&(ch as u8, key))
+                .is_some_and(|p| p.len() > limit * 2)
+        {
+            self.trim_key_voices(ch as u8, key, limit);
         }
         Ok(())
     }
@@ -1344,7 +1539,139 @@ impl GpuSynth {
         }
     }
 
+    /// Trims one (channel, key) voice list to the `limit` loudest note
+    /// groups, marking the rest `ended` (they are dropped by the next
+    /// `retain`). Whole notes are killed, never split zones - mirroring
+    /// XSynth's `pop_quietest_voice_group`. O(key voices), so it must only
+    /// run when the key exceeds its cap, not per note-on.
+    fn trim_key_voices(&mut self, ch: u8, key: u8, limit: usize) {
+        let Some(positions) = self.key_voices.get(&(ch, key)).cloned() else {
+            return;
+        };
+        // Group by note_id (spawn order keeps one note's zones adjacent);
+        // ended voices are freed for free.
+        let mut groups: Vec<(u8, Vec<usize>)> = Vec::new();
+        let mut active = 0usize;
+        for &pos in &positions {
+            let Some(v) = self.voices.get(pos) else {
+                continue;
+            };
+            if v.state.ended != 0 {
+                continue;
+            }
+            active += 1;
+            match groups.last_mut() {
+                Some((_, g)) if self.voices[g[0]].note_id == v.note_id => g.push(pos),
+                _ => groups.push((v.vel, vec![pos])),
+            }
+        }
+        let need_free = active.saturating_sub(limit);
+        if need_free == 0 {
+            return;
+        }
+        groups.sort_by_key(|&(vel, _)| vel);
+        let mut freed = 0usize;
+        for (_, g) in &groups {
+            if freed >= need_free {
+                break;
+            }
+            freed += g.len();
+            for &pos in g {
+                if let Some(v) = self.voices.get_mut(pos) {
+                    v.state.ended = 1;
+                }
+            }
+        }
+        // Compact the key index: drop ended entries so per-event scans
+        // (release_key, further trims) stay bounded by the cap.
+        let kept: VecDeque<usize> = positions
+            .iter()
+            .copied()
+            .filter(|&pos| self.voices.get(pos).is_some_and(|v| v.state.ended == 0))
+            .collect();
+        self.key_voices.insert((ch, key), kept);
+        // Rebuild this key's active-note count exactly. Decrementing by the
+        // killed group count would underflow: the trimmed groups include
+        // already-released notes that were decremented at release time, and
+        // a stale (too-low) count makes the release fast path skip live
+        // notes, leaving them sustained forever.
+        let mut live_notes: Vec<u64> = Vec::new();
+        for &pos in &positions {
+            if let Some(v) = self.voices.get(pos)
+                && v.state.ended == 0
+                && v.release_at == u64::MAX
+                && !live_notes.contains(&v.note_id)
+            {
+                live_notes.push(v.note_id);
+            }
+        }
+        self.active_notes[ch as usize * 128 + key as usize] = live_notes.len() as u8;
+    }
+
+    /// Ends every voice whose exclusive class has a newer note (the newest
+    /// note of a class wins, mirroring XSynth). Runs once per block in
+    /// `upload_voices` - the previous per-note-on scan was O(voices) per
+    /// event and dominated black-MIDI peak blocks.
+    fn trim_exclusive(&mut self) {
+        let mut newest: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
+        for v in &self.voices {
+            if let Some(c) = v.exclusive_class {
+                newest
+                    .entry(c)
+                    .and_modify(|n| *n = (*n).max(v.note_id))
+                    .or_insert(v.note_id);
+            }
+        }
+        if newest.is_empty() {
+            return;
+        }
+        for v in &mut self.voices {
+            if let Some(c) = v.exclusive_class
+                && v.state.ended == 0
+                && newest.get(&c).is_some_and(|&n| n != v.note_id)
+            {
+                v.state.ended = 1;
+            }
+        }
+    }
+
     fn upload_voices(&mut self, base: u64) -> Result<(), SynthError> {
+        // The per-key note-on budget is per block.
+        self.spawn_budget.fill(0);
+        // Exclusive classes resolved once per block.
+        self.trim_exclusive();
+        // Rebuild the active-note counts exactly (trims/exclusive kills may
+        // have left the in-block counters stale). After trim_exclusive, so
+        // killed classes are not counted.
+        self.active_notes.fill(0);
+        for v in &self.voices {
+            if v.state.ended == 0 && v.release_at == u64::MAX {
+                let slot = &mut self.active_notes[v.channel as usize * 128 + v.key as usize];
+                *slot = slot.saturating_add(1);
+            }
+        }
+        // Per-key polyphony trim, deferred from `spawn_voices`: ending voices
+        // per note-on was O(key voices) per event (black-MIDI storms scan
+        // the key for every one of thousands of notes per block); trimming
+        // once per block is O(voices). Semantics mirror XSynth's
+        // `pop_quietest_voice_group`: keep the `max_voices_per_key` loudest
+        // note *groups* of each key (whole notes are killed, never split
+        // zones), quietest first.
+        let per_key_limit = self.config.max_voices_per_key;
+        if per_key_limit > 0 {
+            let keys: Vec<((u8, u8), usize)> = self
+                .key_voices
+                .iter()
+                .filter(|(_, positions)| positions.len() > per_key_limit)
+                .map(|(&k, p)| (k, p.len()))
+                .collect();
+            for ((ch, key), _) in keys {
+                self.trim_key_voices(ch, key, per_key_limit);
+            }
+            self.voices.retain(|v| v.state.ended == 0);
+            self.rebuild_key_voices();
+        }
+
         // Drop voices that ended (state refreshed by the previous readback)
         // and rebuild the per-key index before borrowing the GPU device.
         self.voices.retain(|v| v.state.ended == 0);
@@ -1355,26 +1682,28 @@ impl GpuSynth {
         // because it runs once per block, not once per event.
         if self.voices.len() > self.config.max_voices {
             let over = self.voices.len() - self.config.max_voices;
-            // Group by note; end quietest first. O(n) grouping + partial sort
-            // on `over` elements keeps it fast even at the cap.
-            let mut by_note: Vec<(u8, u64)> = Vec::new();
-            for v in &self.voices {
-                match by_note.last_mut() {
-                    Some((_, note)) if *note == v.note_id => {}
-                    _ => by_note.push((v.vel, v.note_id)),
+            // Group voices by note in one O(n) pass (spawn order keeps one
+            // note's zones adjacent), then end whole quietest groups until
+            // the cap fits. The previous implementation re-scanned the whole
+            // voice list per group (O(over x n)) - hundreds of ms per block
+            // on black-MIDI note storms at the pool cap.
+            let mut groups: Vec<(u8, u64, Vec<usize>)> = Vec::new();
+            for (i, v) in self.voices.iter().enumerate() {
+                match groups.last_mut() {
+                    Some((_, note, _)) if *note == v.note_id => {}
+                    _ => groups.push((v.vel, v.note_id, Vec::new())),
                 }
+                groups.last_mut().unwrap().2.push(i);
             }
-            by_note.sort_by_key(|&(vel, _)| vel);
+            groups.sort_by_key(|&(vel, _, _)| vel);
             let mut freed = 0usize;
-            for (_, note) in by_note {
+            for (_, _, positions) in &groups {
                 if freed >= over {
                     break;
                 }
-                for v in &mut self.voices {
-                    if v.note_id == note && v.state.ended == 0 {
-                        v.state.ended = 1;
-                        freed += 1;
-                    }
+                for &i in positions {
+                    self.voices[i].state.ended = 1;
+                    freed += 1;
                 }
             }
             self.voices.retain(|v| v.state.ended == 0);
@@ -1406,32 +1735,16 @@ impl GpuSynth {
         // voice (wrong int_time -> instant "ended" -> lost notes). Map by
         // voice id.
         //
-        // `prev_voice_ids` is monotonically increasing (voice ids are handed
-        // out by `voice_id_counter` and `retain` keeps order), so a binary
-        // search replaces the per-block HashMap build - a hot path when the
-        // voice pool sits at the cap (dense black-MIDI: ~8k voices).
+        // Voice ids are handed out monotonically and `retain` keeps order,
+        // so BOTH `self.voices` and `prev_voice_ids` are sorted by id: a
+        // two-pointer merge matches them in O(n) without any HashMap or
+        // binary search - those were a hot path at the pool cap
+        // (black-MIDI: ~16k voices per block).
         let prev_ids = &self.prev_voice_ids;
-        let resumed: std::collections::HashMap<u32, VoiceState> = self
-            .last_states
-            .as_ref()
-            .map(|st| {
-                let count = st.len() / VoiceState::SIZE;
-                let mut by_id: std::collections::HashMap<u32, VoiceState> =
-                    std::collections::HashMap::with_capacity(self.voices.len().min(count));
-                for v in self.voices.iter() {
-                    if let Ok(k) = prev_ids.binary_search(&v.id)
-                        && k < count
-                    {
-                        let off = k * VoiceState::SIZE;
-                        let s: &VoiceState = bytemuck::from_bytes(&st[off..off + VoiceState::SIZE]);
-                        by_id.insert(v.id, *s);
-                    }
-                }
-                by_id
-            })
-            .unwrap_or_default();
-
-        self.prev_voice_ids = self.voices.iter().map(|v| v.id).collect();
+        let new_ids: Vec<u32> = self.voices.iter().map(|v| v.id).collect();
+        let last_states = self.last_states.as_ref();
+        let st_count = last_states.map_or(0, |st| st.len() / VoiceState::SIZE);
+        let mut k = 0usize; // cursor into `prev_ids`/`last_states` (both sorted)
 
         for (i, v) in self.voices.iter_mut().enumerate() {
             let sample_offset = self
@@ -1466,10 +1779,26 @@ impl GpuSynth {
             // A voice killed since the last upload (ended=1 set on the CPU
             // side) must stay ended: the resumed state from the previous
             // block predates the kill and would otherwise resurrect it.
+            //
+            // Two-pointer resume lookup: advance `k` to the first prev id
+            // >= v.id; equal ids share a state (voices and prev ids are
+            // both sorted, see above).
+            while k < prev_ids.len() && prev_ids[k] < v.id {
+                k += 1;
+            }
+            let resumed = match last_states {
+                Some(st) if k < prev_ids.len() && prev_ids[k] == v.id && k < st_count => {
+                    let off = k * VoiceState::SIZE;
+                    Some(*bytemuck::from_bytes::<VoiceState>(
+                        &st[off..off + VoiceState::SIZE],
+                    ))
+                }
+                _ => None,
+            };
             states[i] = if v.state.ended != 0 {
                 v.state
             } else {
-                resumed.get(&v.id).copied().unwrap_or(v.state)
+                resumed.unwrap_or(v.state)
             };
             voice_chans[i] = v.channel as u32
                 | ((if v.released || v.release_at != u64::MAX {
@@ -1478,6 +1807,7 @@ impl GpuSynth {
                     0u32
                 }) << 7);
         }
+        self.prev_voice_ids = new_ids;
         // (Upload is deferred to `dispatch` so all GPU work - staging copies,
         // render pass, readback copies - happens in ONE submit; separate
         // submits measured ~9ms each of fixed wgpu/Vulkan overhead.)
@@ -1903,103 +2233,107 @@ impl GpuSynth {
 
         let idx = queue.submit(Some(encoder.finish()));
 
-        // Out pipelining: read back the data of the *previous* submission
-        // (on the first block, of this one). The current submission may
-        // still be in flight, so the GPU stays busy while the CPU prepares
-        // the next block. The map callbacks fire inside the poll below.
-        //
-        // NOTE: the previous-block scheme would replay block 0's audio at
-        // block 1 (the output would lag one block and the first block would
-        // be doubled), so both output and voice states are read back from
-        // the CURRENT submission. This makes the readbacks synchronous, but
-        // correct; the submission index (`idx`) is waited on below.
-        let read_cur = cur;
-        self.prev_submission = Some(idx.clone());
-
-        // Map reads: the callback only signals completion (it cannot unmap -
-        // `unmap` lives on `wgpu::Buffer`, not the slice). The buffer is
-        // unmapped right after the poll below, in ALL cases (success or the
-        // caller handling the returned Err). Never return Err between a map
-        // and its unmap, or the next block's copy to the same buffer hits
-        // wgpu's "Buffer is still mapped" validation error (a hard panic).
-        let (otx, orx) = std::sync::mpsc::channel();
-        {
-            let rb: &wgpu::Buffer = &self.out_readback[read_cur];
-            rb.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                let _ = otx.send(r.is_ok());
-            });
-        }
-        // The states map reads the copy made for THIS block, so its data is
-        // ready only after the current submission completes (`wait` below).
-        let states_map = if self.states_sync_counter == 0 {
-            let rb: &wgpu::Buffer = self.states_readback[cur].buffer();
-            let (stx, srx) = std::sync::mpsc::channel();
-            rb.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                let _ = stx.send(r.is_ok());
-            });
-            Some((rb.clone(), srx))
-        } else {
-            None
-        };
-
-        // Wait for the current submission. This is a correctness dependency,
-        // NOT an idle wait: the output of THIS block is the audio we must
-        // return, so the GPU has to finish it before we can read back. A
-        // timed-out poll here is fatal for realtime: it returns Err, leaves
-        // `out_readback[cur]` mapped and `out_readback_cur` unflipped, and
-        // the next block maps the same buffer again -> wgpu rejects it ->
-        // the render thread loops on errors forever with the GPU at 0%.
-        // (Observed on dense black-MIDI: GPU 0%, CPU 8%, playback frozen.)
-        device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(idx),
-                timeout: None,
-            })
-            .map_err(|e| SynthError::Gpu(format!("poll failed: {e:?}")))?;
-
-        // Read back and unmap in every path: a buffer left mapped here makes
-        // the next block's copy to the same buffer fail wgpu validation
-        // ("Buffer is still mapped") - a hard panic in the render thread.
-        // The poll above has fired the map callbacks, so the receives below
-        // complete immediately.
-        let out_ok = orx.recv().unwrap_or(false);
-        if out_ok {
-            let slice = self.out_readback[read_cur].slice(..);
-            self.last_out = Some(slice.get_mapped_range().to_vec());
-            self.out_readback[read_cur].unmap();
-        } else {
-            return Err(SynthError::Gpu("output readback map failed".into()));
-        }
-        if let Some((rb, srx)) = states_map {
-            let states_ok = srx.recv().unwrap_or(false);
-            if states_ok {
-                self.last_states = Some(rb.slice(..).get_mapped_range().to_vec());
-                rb.unmap();
-            } else {
-                return Err(SynthError::Gpu("states readback map failed".into()));
-            }
-        }
-
-        self.out_readback_cur ^= 1;
-        if self.states_sync_counter == 0 {
-            self.states_readback_cur ^= 1;
-        }
-        // `STATES_SYNC_EVERY = 1` makes the counter always 0 (every block
-        // maps its states); the modulo is intentional and kept for the
+        // One-block pipeline: this submission's readback is consumed by the
+        // next `render_block` (`collect_pending_readback`), so the GPU runs
+        // this block while the CPU maps the PREVIOUS block back - the
+        // per-block synchronous poll wait is gone. Record the exact slots
+        // the copies landed in: they are read back next block, and silent
+        // blocks that skip dispatching never shift this window.
+        self.pending = Some(PendingReadback {
+            idx,
+            out_slot: cur,
+            states_slot: states_cur,
+        });
+        // `STATES_SYNC_EVERY = 1` keeps the counter at 0 (every block maps
+        // its states); the modulo is intentional and kept for the
         // configurable cadence.
         self.states_sync_counter = if STATES_SYNC_EVERY > 1 {
             (self.states_sync_counter + 1) % STATES_SYNC_EVERY
         } else {
             0
         };
-        // The GPU has consumed this block's staging copies (the poll above
-        // waited for the submission); recycle the belt slices for next block.
+        Ok(())
+    }
+
+    /// Polls the pending submission (dispatched by the previous
+    /// `render_block`) and reads its audio + voice states back into
+    /// `last_out`/`last_states`. Called at the start of every
+    /// `render_block`, including silent fast-path blocks: the GPU has had a
+    /// full block of CPU work (apply/upload) to finish the pending
+    /// submission, so the poll returns immediately instead of stalling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SynthError::Gpu`] if the poll or either map fails.
+    fn collect_pending_readback(&mut self) -> Result<(), SynthError> {
+        let Some(p) = self.pending.take() else {
+            return Ok(());
+        };
+        let device = &self.res.ctx.device;
+
+        // Map requests (callbacks fire inside the poll below).
+        let (otx, orx) = std::sync::mpsc::channel();
+        self.out_readback[p.out_slot]
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                let _ = otx.send(r.is_ok());
+            });
+        let (stx, srx) = std::sync::mpsc::channel();
+        let states_rb = self.states_readback[p.states_slot].buffer().clone();
+        states_rb
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                let _ = stx.send(r.is_ok());
+            });
+
+        // The GPU has already finished the pending submission (it had this
+        // block's CPU work to run in); this wait does not stall.
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(p.idx),
+                timeout: None,
+            })
+            .map_err(|e| SynthError::Gpu(format!("poll failed: {e:?}")))?;
+
+        let out_ok = orx.recv().unwrap_or(false);
+        if out_ok {
+            let slice = self.out_readback[p.out_slot].slice(..);
+            self.last_out = Some(slice.get_mapped_range().to_vec());
+            self.out_readback[p.out_slot].unmap();
+        } else {
+            return Err(SynthError::Gpu("output readback map failed".into()));
+        }
+        let states_ok = srx.recv().unwrap_or(false);
+        if states_ok {
+            let rb = self.states_readback[p.states_slot].buffer();
+            let mapped = rb.slice(..).get_mapped_range();
+            let bytes = mapped.to_vec();
+            drop(mapped);
+            self.last_states = Some(bytes);
+            rb.unmap();
+        } else {
+            return Err(SynthError::Gpu("states readback map failed".into()));
+        }
+
+        // Both readback buffers are free again; alternate the slots.
+        self.out_readback_cur ^= 1;
+        self.states_readback_cur ^= 1;
+        // The poll confirmed the pending submission (and every earlier one)
+        // finished, so every closed belt chunk is safe to reclaim. wgpu 27's
+        // StagingBelt additionally guards reuse itself: recalled chunks are
+        // re-mapped and only re-enter the free pool after the GPU releases
+        // them, so a chunk can never be overwritten while in flight.
         self.belt.recall();
         Ok(())
     }
+
     fn readback(&mut self, out: &mut [f32]) -> Result<(), SynthError> {
         let Some(data) = self.last_out.take() else {
-            return Err(SynthError::Gpu("no output data".into()));
+            // First block of a stream has no previous dispatch to collect
+            // from: the pipeline owes the listener silence for that block
+            // (block 0's audio arrives with block 1).
+            out.fill(0.0);
+            return Ok(());
         };
         let count = (data.len() / 4).min(out.len());
         out[..count].copy_from_slice(bytemuck::cast_slice(&data[..count * 4]));
@@ -2008,14 +2342,19 @@ impl GpuSynth {
 
     /// Applies the read-back voice states to the CPU mirror.
     ///
-    /// Does *not* consume `last_states`: the next block's `upload_voices`
-    /// resumes the GPU from these exact states (the readback lags one block
-    /// by design, so the CPU mirror alone is one block stale and would
-    /// replay the previous block). `upload_voices` clears it after use.
+    /// Runs right after `collect_pending_readback` and BEFORE
+    /// `upload_voices`, so the mirror reflects the GPU state of the block
+    /// just read back (the one the next dispatch resumes from). A voice
+    /// that ended on the GPU gets `v.state.ended = 1` here, which lets
+    /// `upload_voices` prune it this same block.
     ///
-    /// Maps by voice id (`prev_voice_ids` records the upload order): the
-    /// list may have shrunk since, so positional lookup would apply a
+    /// Maps by voice id (`prev_voice_ids` records the last upload order):
+    /// the list may have shrunk since, so positional lookup would apply a
     /// stale state (and miss `ended`) on the wrong voice.
+    ///
+    /// Does NOT consume `prev_voice_ids`: that list must stay aligned with
+    /// `last_states` (same upload order) for `upload_voices`' resume
+    /// matching, which runs on the very same read-back states.
     fn sync_voice_states(&mut self) {
         let Some(states) = self.last_states.as_ref() else {
             return;
@@ -2024,23 +2363,23 @@ impl GpuSynth {
         if count == 0 {
             return;
         }
-        let ids = std::mem::take(&mut self.prev_voice_ids);
-        let mut pos_by_id: std::collections::HashMap<u32, usize> =
-            std::collections::HashMap::with_capacity(ids.len());
-        for (i, id) in ids.into_iter().enumerate() {
-            pos_by_id.insert(id, i);
-        }
+        // `prev_voice_ids` and `self.voices` are both sorted by voice id
+        // (monotonic counter, `retain` keeps order), so a two-pointer merge
+        // maps states back onto the mirror in O(n) - no HashMap build.
+        let ids = &self.prev_voice_ids;
+        let mut k = 0usize;
         for v in self.voices.iter_mut() {
-            if let Some(&i) = pos_by_id.get(&v.id) {
-                if i >= count {
-                    continue;
-                }
-                let off = i * VoiceState::SIZE;
-                let st: &VoiceState = bytemuck::from_bytes(&states[off..off + VoiceState::SIZE]);
-                v.state = *st;
-                if st.ended != 0 {
-                    v.released = true;
-                }
+            while k < ids.len() && ids[k] < v.id {
+                k += 1;
+            }
+            if k >= ids.len() || ids[k] != v.id || k >= count {
+                continue;
+            }
+            let off = k * VoiceState::SIZE;
+            let st: &VoiceState = bytemuck::from_bytes(&states[off..off + VoiceState::SIZE]);
+            v.state = *st;
+            if st.ended != 0 {
+                v.released = true;
             }
         }
     }

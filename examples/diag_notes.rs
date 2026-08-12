@@ -26,23 +26,23 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let mut on_secs: HashMap<u64, u64> = HashMap::new();
 
     for ev in &midi.sequence.events {
-        match ev.event {
+        match ev.event() {
             NoteOn { key, vel } => {
                 let b = if vel <= 1 { 0 } else { 1 };
                 vel_buckets[b] += 1;
                 pending
-                    .entry((ev.channel, key))
+                    .entry((ev.channel(), key))
                     .or_default()
-                    .push(ev.sample);
-                on_samples.push(ev.sample);
-                *on_secs.entry(ev.sample / sr).or_insert(0) += 1;
+                    .push(ev.sample as u64);
+                on_samples.push(ev.sample as u64);
+                *on_secs.entry(ev.sample as u64 / sr).or_insert(0) += 1;
                 concurrency += 1;
                 if concurrency > max_concurrency {
                     max_concurrency = concurrency;
                 }
             }
             NoteOff { key } => {
-                let q = pending.get_mut(&(ev.channel, key));
+                let q = pending.get_mut(&(ev.channel(), key));
                 match q.and_then(|q| {
                     if q.is_empty() {
                         None
@@ -50,7 +50,7 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
                         Some(q.remove(0))
                     }
                 }) {
-                    Some(start) => lengths.push(ev.sample - start),
+                    Some(start) => lengths.push(ev.sample as u64 - start),
                     None => misses += 1,
                 }
                 concurrency = concurrency.saturating_sub(1);
@@ -110,7 +110,7 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let mut peak_at = 0u64;
     let mut density: Vec<(u64, u64, u64, u64)> = Vec::new(); // (sec, ons, peak, peak_at)
     for ev in &midi.sequence.events {
-        match ev.event {
+        match ev.event() {
             NoteOn { vel, .. } if vel > 1 => {
                 cur += 1;
                 win_on += 1;
@@ -122,11 +122,11 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
         }
         if cur > win_peak {
             win_peak = cur;
-            peak_at = ev.sample;
+            peak_at = ev.sample as u64;
         }
-        if ev.sample - wstart >= 10 * sr {
+        if ev.sample as u64 - wstart >= 10 * sr {
             density.push((wstart / sr, win_on, win_peak, peak_at / sr));
-            wstart = ev.sample;
+            wstart = ev.sample as u64;
             win_on = 0;
             win_peak = 0;
         }

@@ -20,11 +20,14 @@ pub const SAMPLES_CHUNKS: usize = 4;
 
 /// Number of segments each voice block is split into (gid.y of the render
 /// kernel). More segments = more GPU parallelism for dense polyphony; the
-/// shader fast-forwards the voice state to each segment start. 16 segments
-/// of a 1024-frame block = 64 frames per thread. Filtered (biquad) voices
-/// are signal-dependent and fall back to single-segment rendering, which is
-/// correct (just less parallel) - so audio quality is unaffected.
-pub const RENDER_SEGMENTS: u32 = 16;
+/// shader fast-forwards the voice state to each segment start. Filtered
+/// (biquad) voices are signal-dependent and fall back to single-segment
+/// rendering, which is correct (just less parallel) - so audio quality is
+/// unaffected.
+///
+/// Must match the `SEGS` constant injected into `render.wgsl` at pipeline
+/// creation (see `create_render_pipeline`).
+pub const RENDER_SEGMENTS: u32 = 4;
 
 /// Capacity of one sample chunk in bytes (1 GiB, well below the 2 GiB
 /// `max_storage_buffer_binding_size` requested from the adapter).
@@ -400,10 +403,15 @@ fn create_render_pipeline(
     layout: &wgpu::BindGroupLayout,
     block_size: usize,
 ) -> Result<wgpu::ComputePipeline, SynthError> {
-    let source = include_str!("shaders/render.wgsl").replace(
-        "const BLOCK: u32 = 512u;",
-        &format!("const BLOCK: u32 = {block_size}u;"),
-    );
+    let source = include_str!("shaders/render.wgsl")
+        .replace(
+            "const BLOCK: u32 = 512u;",
+            &format!("const BLOCK: u32 = {block_size}u;"),
+        )
+        .replace(
+            "const SEGS: u32 = 16u;",
+            &format!("const SEGS: u32 = {}u;", RENDER_SEGMENTS),
+        );
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("render.wgsl"),
         source: wgpu::ShaderSource::Wgsl(source.into()),

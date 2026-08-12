@@ -21,7 +21,14 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
         .unwrap_or(0.0);
 
     let config = SynthConfig {
-        block_size: 2048,
+        block_size: std::env::var("LUMINO_BLOCK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2048),
+        max_voices: std::env::var("LUMINO_VOICES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16_384),
         show_progress: true,
         envelope_curves: if std::env::var("LUMINO_LERP_ENV").is_ok() {
             lumino_gpu_synth::synth::dsp::EnvelopeCurveConfig {

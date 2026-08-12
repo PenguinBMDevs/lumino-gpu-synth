@@ -7,7 +7,8 @@ use lumino_midly::num::u24;
 use lumino_midly::{MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
 
 use crate::SynthError;
-use crate::midi::{MidiEvent, MidiSequence, TimedEvent};
+use crate::midi::kind;
+use crate::midi::{MidiSequence, TimedEvent};
 
 /// A parsed MIDI file.
 ///
@@ -66,59 +67,27 @@ impl MidiFile {
             return Err(SynthError::Midi("zero ticks per beat".into()));
         }
 
-        // Collect per-track event lists with absolute tick positions.
-        let mut raw_events: Vec<(u64, u8, MidiEvent)> = Vec::new();
+        // ---- pass 1: tempo map --------------------------------------------
+        // Tempo events are few (even in automated files); collect them
+        // first so pass 2 can convert ticks -> samples directly without a
+        // second event list sitting in memory.
         let mut tempos: Vec<(u64, u32)> = Vec::new();
         let mut length_ticks: u64 = 0;
-
         for track in &smf.tracks {
             let mut tick: u64 = 0;
             for ev in track {
                 tick += ev.delta.as_int() as u64;
                 length_ticks = length_ticks.max(tick);
-                match &ev.kind {
-                    TrackEventKind::Meta(MetaMessage::Tempo(us_per_beat)) => {
-                        tempos.push((tick, u24_to_u32(*us_per_beat)));
-                    }
-                    TrackEventKind::Meta(MetaMessage::EndOfTrack) => {}
-                    TrackEventKind::Midi { channel, message } => {
-                        let channel = channel.as_int();
-                        let event = match *message {
-                            MidiMessage::NoteOn { key, vel } => {
-                                let vel = vel.as_int();
-                                if vel == 0 {
-                                    MidiEvent::NoteOff { key }
-                                } else {
-                                    MidiEvent::NoteOn { key, vel }
-                                }
-                            }
-                            MidiMessage::NoteOff { key, .. } => MidiEvent::NoteOff { key },
-                            MidiMessage::Controller { controller, value } => {
-                                MidiEvent::ControlChange {
-                                    controller: controller.as_int(),
-                                    value: value.as_int(),
-                                }
-                            }
-                            MidiMessage::ProgramChange { program } => MidiEvent::ProgramChange {
-                                program: program.as_int(),
-                            },
-                            MidiMessage::PitchBend { bend } => MidiEvent::PitchBend {
-                                value: bend.0.as_int(),
-                            },
-                            _ => continue,
-                        };
-                        raw_events.push((tick, channel, event));
-                    }
-                    _ => {}
+                if let TrackEventKind::Meta(MetaMessage::Tempo(us_per_beat)) = &ev.kind {
+                    tempos.push((tick, u24_to_u32(*us_per_beat)));
                 }
             }
         }
 
-        // Tempo map with cumulative seconds per segment, so tick -> seconds
-        // is a binary search instead of a scan (large automated files can
-        // contain hundreds of thousands of tempo events; a linear scan per
-        // event would be O(events x tempos) and take minutes).
-        // The default tempo is 500_000 us/beat (120 BPM).
+        // Cumulative seconds per tempo segment; tick -> seconds is a binary
+        // search (large automated files can contain hundreds of thousands of
+        // tempo events; a linear scan per event would be O(events x tempos)).
+        // Default tempo is 500_000 us/beat (120 BPM).
         let mut tempo_segs: Vec<(u64, f64, f64)> = Vec::with_capacity(tempos.len() + 1);
         let mut prev_tick = 0u64;
         let mut prev_tempo = 500_000.0;
@@ -132,27 +101,55 @@ impl MidiFile {
         }
         tempo_segs.push((prev_tick, cum_secs, prev_tempo));
 
-        let ticks_to_sec = |tick: u64| -> f64 {
-            // Last segment whose start tick is <= `tick`.
+        let ticks_to_sample = |tick: u64| -> u32 {
             let i = tempo_segs
                 .partition_point(|&(start_tick, _, _)| start_tick <= tick)
                 .saturating_sub(1);
             let (start_tick, cum, us) = tempo_segs[i];
-            cum + (tick - start_tick) as f64 * us / 1_000_000.0 / ticks_per_beat as f64
+            let sec = cum + (tick - start_tick) as f64 * us / 1_000_000.0 / ticks_per_beat as f64;
+            (sec * sample_rate as f64).round() as u32
         };
 
-        let mut events: Vec<TimedEvent> = raw_events
-            .into_iter()
-            .map(|(tick, channel, event)| {
-                let sec = ticks_to_sec(tick);
-                let sample = (sec * sample_rate as f64).round() as u64;
-                TimedEvent {
-                    sample,
-                    channel,
-                    event,
-                }
-            })
-            .collect();
+        // ---- pass 2: build the packed event stream directly --------------
+        // No intermediate `(tick, channel, MidiEvent)` list: black-MIDI
+        // files hold 100-200M events, and a second 16-byte-per-event list
+        // would double the peak memory (multi-GB on "Rekt Apple!!.mid").
+        // Events are appended to the final Vec as they are read, so the
+        // only big allocations are the final 8-byte-per-event array and
+        // midly's own parse tree (freed when `smf` drops below).
+        let mut events: Vec<TimedEvent> = Vec::new();
+        for track in &smf.tracks {
+            let mut tick: u64 = 0;
+            for ev in track {
+                tick += ev.delta.as_int() as u64;
+                let TrackEventKind::Midi { channel, message } = &ev.kind else {
+                    continue;
+                };
+                let channel = channel.as_int();
+                let (k, payload) = match *message {
+                    MidiMessage::NoteOn { key, vel } => {
+                        let vel = vel.as_int();
+                        if vel == 0 {
+                            (kind::NOTE_OFF, key as u32)
+                        } else {
+                            (kind::NOTE_ON, key as u32 | ((vel as u32) << 8))
+                        }
+                    }
+                    MidiMessage::NoteOff { key, .. } => (kind::NOTE_OFF, key as u32),
+                    MidiMessage::Controller { controller, value } => (
+                        kind::CONTROL_CHANGE,
+                        controller.as_int() as u32 | ((value.as_int() as u32) << 8),
+                    ),
+                    MidiMessage::ProgramChange { program } => {
+                        (kind::PROGRAM_CHANGE, program.as_int() as u32)
+                    }
+                    MidiMessage::PitchBend { bend } => (kind::PITCH_BEND, bend.0.as_int() as u32),
+                    _ => continue,
+                };
+                events.push(TimedEvent::new(ticks_to_sample(tick), channel, k, payload));
+            }
+        }
+
         // Stable sort by sample only: events at the same tick keep the
         // original MIDI order (track order, then per-track order), exactly
         // like XSynth's merged track iterator. Sorting by channel as well
@@ -160,7 +157,7 @@ impl MidiFile {
         // change note lifetimes relative to the reference.
         events.sort_by_key(|e| e.sample);
 
-        let end_sample = (ticks_to_sec(length_ticks) * sample_rate as f64).round() as u64;
+        let end_sample = ticks_to_sample(length_ticks) as u64;
 
         Ok(Self {
             sequence: MidiSequence { events, end_sample },

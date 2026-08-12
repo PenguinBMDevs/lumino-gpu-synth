@@ -170,7 +170,7 @@ impl AudioPlayback {
     ///
     /// Returns [`SynthError::Gpu`] if no audio output device is available or
     /// the stream cannot be opened.
-    pub fn start(synth: GpuSynth) -> Result<Self, SynthError> {
+    pub fn start(mut synth: GpuSynth) -> Result<Self, SynthError> {
         let engine_rate = synth.config().sample_rate;
         let channels = synth.config().channels.channel_count();
         let block = synth.config().block_size;
@@ -257,6 +257,31 @@ impl AudioPlayback {
         stream
             .play()
             .map_err(|e| SynthError::Gpu(format!("audio stream play: {e}")))?;
+
+        // Pre-fill the queue with a few silent blocks BEFORE the render
+        // thread and the audio callback race each other: the callback can
+        // fire as soon as `stream.play()` above returns, and the first real
+        // (dense) block takes tens of ms to render - without this cushion
+        // the opening of black-MIDI underruns. The blocks are silence (no
+        // events are loaded yet) and stream out at the normal pace. 8
+        // blocks (~170ms at 2048/48k) covers the first dense block render
+        // plus the render thread's catch-up burst.
+        {
+            let mut warm_buf = vec![0.0f32; block * channels];
+            let mut warm_resampler = LinearResampler::new(engine_rate, device_rate, channels);
+            for _ in 0..8 {
+                let _ = synth.render_block(&mut warm_buf);
+                let out = if needs_resample {
+                    warm_resampler.process(&warm_buf)
+                } else {
+                    warm_buf.clone()
+                };
+                stats.samples.fetch_add(out.len() as i64, Ordering::SeqCst);
+                sample_tx
+                    .send(out)
+                    .expect("queue prefill: audio queue must be empty at start");
+            }
+        }
 
         // Render thread: owns the engine and renders continuously. The
         // cadence is the block's wall-clock duration * 90% so the thread can
@@ -354,6 +379,10 @@ impl AudioPlayback {
                     thread_stats.push_render_load(elapsed / total);
 
                     // Push without dropping: wait while the queue is full.
+                    // The wait below is backpressure (the consumer is
+                    // draining), NOT render load - so the render-load
+                    // percentage is recorded BEFORE it, once per block,
+                    // from the actual `render_block` cost only.
                     loop {
                         if sample_tx.try_send(out.clone()).is_ok() {
                             break;
@@ -363,15 +392,6 @@ impl AudioPlayback {
                         }
                         std::thread::sleep(delay / 10);
                     }
-
-                    // Record the render-load percentage (elapsed / budget).
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let total = delay.as_secs_f64();
-                    thread_stats.push_render_load(elapsed / total);
-
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let total = delay.as_secs_f64();
-                    thread_stats.push_render_load(elapsed / total);
 
                     // Sleep until the next cadence point (90% of realtime) to
                     // play in real time - UNLESS the queue is below the

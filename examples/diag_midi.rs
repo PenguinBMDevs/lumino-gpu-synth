@@ -32,7 +32,7 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let (mut note_on, mut note_off, mut cc, mut pc, mut pb) = (0, 0, 0, 0, 0);
     for ev in &midi.sequence.events {
         use lumino_gpu_synth::midi::MidiEvent::*;
-        match ev.event {
+        match ev.event() {
             NoteOn { .. } => note_on += 1,
             NoteOff { .. } => note_off += 1,
             ControlChange { .. } => cc += 1,
@@ -43,12 +43,16 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     println!("note_on={note_on} note_off={note_off} cc={cc} pc={pc} pb={pb}");
     // First/last event samples.
     if let (Some(f), Some(l)) = (midi.sequence.events.first(), midi.sequence.events.last()) {
-        println!("first event: sample={} channel={}", f.sample, f.channel);
+        println!(
+            "first event: sample={} channel={}",
+            f.sample as u64,
+            f.channel()
+        );
         println!(
             "last event: sample={} ({:.3}s) channel={}",
-            l.sample,
+            l.sample as u64,
             l.sample as f64 / 64000.0,
-            l.channel
+            l.channel()
         );
     }
     Ok(())

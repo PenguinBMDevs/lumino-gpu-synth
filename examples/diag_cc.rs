@@ -13,7 +13,7 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let midi = MidiFile::load(&path, 64_000)?;
     let mut hist: BTreeMap<u8, (u64, BTreeMap<u8, u64>)> = BTreeMap::new();
     for ev in &midi.sequence.events {
-        if let MidiEvent::ControlChange { controller, value } = ev.event {
+        if let MidiEvent::ControlChange { controller, value } = ev.event() {
             let e = hist.entry(controller).or_default();
             e.0 += 1;
             *e.1.entry(value).or_default() += 1;

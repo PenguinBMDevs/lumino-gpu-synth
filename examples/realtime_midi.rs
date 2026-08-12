@@ -43,8 +43,21 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let sample_rate = 48_000;
     let config = SynthConfig {
         sample_rate,
-        block_size: 2048,
-        max_voices: 512,
+        // 2048-frame blocks: the pipelined readback hides the GPU render
+        // time behind the CPU work of the next block, so the per-block GPU
+        // cost no longer needs a 170ms budget to amortize. 2048 frames at
+        // 48 kHz = 42.7 ms per block with ~43 ms first-note latency.
+        block_size: std::env::var("LUMINO_RT_BLOCK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2048),
+        // 2048-voice pool: the GPU render cost is proportional to the
+        // active voice count, and 2048 layers of the loudest notes keep the
+        // render load of dense black-MIDI under 30% (see session notes).
+        max_voices: std::env::var("LUMINO_RT_VOICES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2048),
         show_progress: false,
         ..SynthConfig::default()
     };
@@ -67,8 +80,8 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
         .sequence
         .events
         .iter()
-        .fold(0u16, |m, e| m.max((e.channel + 1) as u16));
-    let end_sample = midi.sequence.events.last().map_or(0, |e| e.sample);
+        .fold(0u16, |m, e| m.max((e.channel() + 1) as u16));
+    let end_sample = midi.sequence.events.last().map_or(0, |e| e.sample as u64);
     let events = midi.sequence.events;
     println!(
         "loaded {} events, {:.2}s, {} channel(s) from {midi_path}",

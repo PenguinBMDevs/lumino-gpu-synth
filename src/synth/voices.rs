@@ -11,7 +11,12 @@ use crate::synth::dsp::{
 };
 
 /// A single active voice (one zone of one note).
-#[derive(Debug)]
+///
+/// `Clone` powers the voice-template cache (`GpuSynth::voice_templates`):
+/// black-MIDI note storms spawn thousands of identical (key, vel, channel)
+/// notes per block, and cloning a pre-built voice skips the zone lookup and
+/// envelope-stage computation per note.
+#[derive(Debug, Clone)]
 pub struct Voice {
     /// Index of this voice in the engine's voice list (GPU voice id).
     pub id: u32,
