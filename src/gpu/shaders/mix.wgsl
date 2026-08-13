@@ -70,6 +70,15 @@ fn lerp_advance(current: f32, step: f32, end: f32, n: f32) -> f32 {
     return current;
 }
 
+// NOTE: the mix output is the raw voice sum - possibly far past full scale
+// (hundreds/thousands of voices accumulate with no headroom management).
+// f32 holds it losslessly. Anti-crackle headroom is applied on the CPU side
+// (engine.rs `apply_limiter`): a block-level peak limiter that scales the
+// whole block, preserving the waveform exactly. A per-sample saturation in
+// the shader was tried first but had to squeeze the entire 1.0..~700 range
+// into the 1.0..1.05 band, flat-topping every overloaded block into
+// square-wave distortion - worse than clipping.
+
 @compute
 @workgroup_size(128)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

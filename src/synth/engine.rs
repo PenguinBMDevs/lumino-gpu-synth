@@ -196,6 +196,24 @@ pub struct GpuSynth {
     /// `(sample, channel, controller, value)`.
     pending_mix_events: Vec<(u64, u8, u8, u8)>,
     active_voice_count: u32,
+    /// Output peak limiter gain (applied on the CPU side, after readback).
+    ///
+    /// The mix pass sums every active voice with no headroom management, so
+    /// extreme instantaneous polyphony (hundreds to thousands of voices)
+    /// peaks far past full scale (64 voices ~10x, 4096 ~600x). The output
+    /// must be throttled, but a per-sample soft clip would have to squeeze
+    /// the whole 1.0..~700 range into the 1.0..1.05 band, flat-topping the
+    /// waveform into square-wave distortion (worse than clipping, verified
+    /// empirically). Instead a block-level limiter scales the WHOLE block
+    /// by a scalar gain: the waveform is preserved exactly, the peak lands
+    /// at ~0.98, and the gain recovers exponentially (see `apply_limiter`).
+    ///
+    /// Attack is immediate: this block's gain is set from THIS block's peak
+    /// (the data is already in hand at readback), so an overloaded block is
+    /// throttled from its first sample - there is no attack-lag window
+    /// leaking raw sums to the listener. Release is a ~50 ms exponential
+    /// recovery so the volume returns without pumping or block-step clicks.
+    limiter_gain: f32,
     // Readback staging (filled by dispatch, consumed by readback/sync).
     last_out: Option<Vec<u8>>,
     last_states: Option<Vec<u8>>,
@@ -442,6 +460,7 @@ impl GpuSynth {
             offline_cursor: 0,
             pending_mix_events: Vec::new(),
             active_voice_count: 0,
+            limiter_gain: 1.0,
             last_out: None,
             last_states: None,
             prev_voice_ids: Vec::new(),
@@ -661,6 +680,10 @@ impl GpuSynth {
             } else {
                 out[..block * chs].fill(0.0);
             }
+            // The replayed block is the last DISPATCHED block's audio, which
+            // the limiter would have scaled at its own readback; scale it
+            // again so the limiter state stays continuous either way.
+            self.apply_limiter(&mut out[..block * chs]);
             self.global_frame += block as u64;
             if prof {
                 eprintln!(
@@ -2337,7 +2360,59 @@ impl GpuSynth {
         };
         let count = (data.len() / 4).min(out.len());
         out[..count].copy_from_slice(bytemuck::cast_slice(&data[..count * 4]));
+        self.apply_limiter(out);
         Ok(())
+    }
+
+    /// Block-level output peak limiter (see the `limiter_gain` field doc).
+    ///
+    /// The mix pass returns the raw voice sum (f32 holds it losslessly even
+    /// at hundreds/thousands of voices). This scales the whole block by a
+    /// scalar gain, preserving the waveform exactly (a scalar gain does not
+    /// reshape the signal, unlike any per-sample saturation).
+    ///
+    /// Attack: the target is derived from THIS block's peak (the data is
+    /// already in hand at readback) and applied to the whole block from its
+    /// first sample - an overloaded block is throttled with NO attack-lag
+    /// window, so no raw sum ever leaks to the listener.
+    ///
+    /// Release: the gain recovers exponentially (~50 ms) when the peak drops
+    /// below 0.98, so the volume returns without pumping, and the per-block
+    /// gain change is small enough that block boundaries stay click-free.
+    ///
+    /// Below the 0.98 threshold the target is 1.0 and (once recovered) the
+    /// output passes through bit-identical - reference renders never exceed
+    /// full scale, so reference comparison is unaffected.
+    fn apply_limiter(&mut self, out: &mut [f32]) {
+        // NaN/Inf cannot happen from finite inputs, but a guard keeps a
+        // pathological voice from poisoning the limiter into silence.
+        let mut peak = 0.0f32;
+        for &s in out.iter() {
+            let a = s.abs();
+            if a.is_finite() {
+                peak = peak.max(a);
+            }
+        }
+        // Target: pull the block peak down to 0.98 (2% headroom).
+        let target = if peak > 0.98 { 0.98 / peak } else { 1.0 };
+        // Immediate attack on overload (the block is scaled from its first
+        // sample); exponential release back to unity.
+        if target < self.limiter_gain {
+            self.limiter_gain = target;
+        } else {
+            let block_time = self.config.block_size as f32 / self.config.sample_rate.max(1) as f32;
+            let alpha = 1.0 - (-block_time / 0.05).exp();
+            self.limiter_gain += (target - self.limiter_gain) * alpha;
+        }
+
+        let g = self.limiter_gain;
+        // Skip the multiply when at unity (the common case - keeps normal
+        // renders bit-identical).
+        if g != 1.0 {
+            for s in out.iter_mut() {
+                *s *= g;
+            }
+        }
     }
 
     /// Applies the read-back voice states to the CPU mirror.
