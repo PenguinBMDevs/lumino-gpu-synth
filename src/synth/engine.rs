@@ -2140,9 +2140,18 @@ impl GpuSynth {
         // pool, end those too (order is preserved for the id-based state
         // resume).
         {
+            // Measure against the voices still *alive* (not already marked
+            // ended by the cap above). The first cap may have ended a large
+            // fraction of the overflow, so the raw `voices.len()` would still
+            // report the full pre-trim count and `kill` would be recomputed
+            // from it - ending the survivors a second time and wiping the
+            // entire pool at extreme polyphony (the "silence at high note
+            // count" bug: a black-MIDI storm spawns far more voices in one
+            // block than the pool, and the double-kill left zero voices).
+            let alive = self.voices.iter().filter(|v| v.state.ended == 0).count();
             let pool = self.config.max_voices + self.config.max_voices / FADE_SLOTS_FRACTION;
-            if self.voices.len() > pool {
-                let mut kill = self.voices.len() - pool;
+            if alive > pool {
+                let mut kill = alive - pool;
                 for v in self.voices.iter_mut() {
                     if v.fade_out && kill > 0 {
                         v.state.ended = 1;
@@ -2652,6 +2661,36 @@ impl GpuSynth {
         ) {
             self.render_bg_dirty = true;
             self.mix_bg_dirty = true;
+        }
+        // The per-voice GPU storage buffers (params/states/env) are written by
+        // the staging belt below at `n` voices, but unlike `voice_out_buf` /
+        // `voice_chans_buf` they were only ever allocated at the pool size and
+        // never grown. If the voice cap leaves slightly more than `pool` voices
+        // (it releases whole note groups, so the survivor count can overshoot
+        // by a group or two), the belt write overruns the fixed buffer and
+        // wgpu aborts the whole submission with a validation error. Grow them
+        // here, the same way the output buffers are grown. All three are bound
+        // by the render bind group, so a grow dirties it for the rebuild below.
+        if self.params_buf.ensure(
+            &self.res.ctx.device,
+            &self.res.ctx.queue,
+            (std::mem::size_of::<VoiceParams>() * voices as usize) as u64,
+        ) {
+            self.render_bg_dirty = true;
+        }
+        if self.states_buf.ensure(
+            &self.res.ctx.device,
+            &self.res.ctx.queue,
+            (std::mem::size_of::<VoiceState>() * voices as usize) as u64,
+        ) {
+            self.render_bg_dirty = true;
+        }
+        if self.env_buf.ensure(
+            &self.res.ctx.device,
+            &self.res.ctx.queue,
+            (std::mem::size_of::<EnvStageGpu>() * self.upload_env_stages.len().max(1)) as u64,
+        ) {
+            self.render_bg_dirty = true;
         }
         if self.render_bg_dirty {
             self.rebuild_bind_groups();
