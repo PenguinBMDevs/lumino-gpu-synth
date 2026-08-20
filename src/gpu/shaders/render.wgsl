@@ -80,7 +80,14 @@ const BLOCK: u32 = 512u;
 
 // ---------- helpers ----------
 
-fn env_eval(kind: u32, from_val: f32, target_val: f32, f: f32) -> f32 {
+fn env_eval(kind: u32, from_val: f32, target_val: f32, f_in: f32) -> f32 {
+    // Clamp the stage progress to [0, 1]. A stale `env_t` (larger than the
+    // stage duration, e.g. after a long-gap resume) would otherwise feed
+    // prog > 1 into the curve formulas: CONCAVE's ((1-prog)^2)^4 explodes
+    // to hundreds of millions and the voice outputs a single-sample pop
+    // (measured: 9.2e8 in the mix at high polyphony - the "crackle at
+    // 800-1000 voices" report).
+    let f = clamp(f_in, 0.0, 1.0);
     if kind == 0u {
         return from_val + (target_val - from_val) * f;
     }
@@ -192,6 +199,11 @@ fn advance_frame(p: VoiceParams, st: VoiceState, env_value: f32, frame: u32) -> 
         s.env_stage = p.release_idx;
         s.env_t = 0u;
         s.env_from = ev;
+        // Capture the loop position at the instant of release so a loop-sustain
+        // (mode 2) voice continues from `loop_end` for the correct number of
+        // samples after release; otherwise the release tail is computed from a
+        // stale/block-start position and jumps.
+        s.last_loop_pos = s.int_time;
     }
 
     // --- envelope ---
@@ -282,22 +294,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let seg_start = select(seg * SEG_LEN, 0u, is_filtered);
     let seg_end = select(min(seg_start + SEG_LEN, BLOCK), BLOCK, is_filtered);
     if (is_filtered && seg > 0u) {
-        var z = seg_start;
-        while (z < seg_end) {
-            let zi = out_base + z * 2u;
-            voice_out[zi] = 0.0;
-            voice_out[zi + 1u] = 0.0;
-            z = z + 1u;
-        }
+        // Filtered (biquad) voices are rendered entirely by segment 0: the
+        // filter state is signal-dependent and cannot be fast-forwarded, so the
+        // other segments must leave this voice's output untouched. The old code
+        // zeroed the WHOLE block here, racing with segment 0's real writes and
+        // corrupting the signal at the segment boundary (a "chunk" boundary in
+        // the voice block) - a source of crackle/pops for filtered voices.
         return;
     }
 
-    // Track the last loop position for loop-sustain release handling
-    // (recorded by the first segment only; the other segments read the
-    // block-start state, which is what the original loop used).
-    if (p.loop_mode == 2u && st.is_released == 0u && seg == 0u) {
-        st.last_loop_pos = st.int_time;
-    }
+    // NOTE: the loop-sustain release position is captured at the moment of
+    // release inside `advance_frame` (so it tracks the true loop position),
+    // NOT here - capturing it at the block start (as a previous version did)
+    // froze `last_loop_pos` at the block-start time for the whole block and,
+    // worse, overwrote the value persisted from the block where the voice was
+    // actually released, producing wrong release tails / discontinuities.
 
     var env_value = st.env_from;
 

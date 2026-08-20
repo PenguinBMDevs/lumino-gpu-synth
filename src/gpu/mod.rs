@@ -119,13 +119,15 @@ pub struct GrowableBuffer {
 
 impl GrowableBuffer {
     /// Creates a growable storage buffer with an initial `capacity` bytes.
+    /// The initial allocation is zeroed (see `with_max_capacity`).
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         label: &str,
         capacity: u64,
         usage: wgpu::BufferUsages,
     ) -> Self {
-        Self::with_max_capacity(device, label, capacity, u64::MAX, usage)
+        Self::with_max_capacity(device, queue, label, capacity, u64::MAX, usage)
     }
 
     /// Creates a growable storage buffer whose size is capped at
@@ -133,6 +135,7 @@ impl GrowableBuffer {
     /// allocating unbounded memory.
     pub fn with_max_capacity(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         label: &str,
         capacity: u64,
         max_capacity: u64,
@@ -146,6 +149,18 @@ impl GrowableBuffer {
             usage: effective,
             mapped_at_creation: false,
         });
+        // Zero the initial allocation. wgpu does NOT zero storage buffers,
+        // and several buffers (the chunked sample storage above all) can be
+        // read past their written region at runtime - a voice may play past
+        // the resampled data when the SF2's declared sample_end exceeds the
+        // actual rendered length, and that slot must read as silence, not as
+        // uninitialized garbage (measured: single samples in the hundreds of
+        // millions, audible as loud pops at high polyphony).
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        if size > 0 {
+            encoder.clear_buffer(&buffer, 0, Some(size));
+        }
+        queue.submit(Some(encoder.finish()));
         Self {
             buffer,
             size,
@@ -191,12 +206,25 @@ impl GrowableBuffer {
             mapped_at_creation: false,
         });
         let can_copy_src = !self.usage.contains(wgpu::BufferUsages::MAP_READ);
-        if self.size > 0 && can_copy_src {
-            let mut encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            encoder.copy_buffer_to_buffer(&self.buffer, 0, &new_buf, 0, self.size);
-            queue.submit(Some(encoder.finish()));
+        let old_size = self.size;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        // The ENTIRE new buffer is zeroed: wgpu does not zero storage
+        // buffers, and the voice output buffer is only fully written when
+        // the voice count is at its historical maximum - on the block where
+        // it grows, slots above the old size are not covered by the render
+        // pass yet, and the mix pass would sum that garbage into the output
+        // (measured: single samples in the hundreds of millions, audible as
+        // pops/crackle at high polyphony). Old contents are carried over via
+        // copy only when the buffer needs them (growable working buffers);
+        // zeroing first keeps the semantic "everything unwritten reads as
+        // silence" for every slot.
+        if new_size > 0 {
+            encoder.clear_buffer(&new_buf, 0, Some(new_size));
         }
+        if old_size > 0 && can_copy_src {
+            encoder.copy_buffer_to_buffer(&self.buffer, 0, &new_buf, 0, old_size);
+        }
+        queue.submit(Some(encoder.finish()));
         self.buffer = new_buf;
         self.size = new_size;
         true
@@ -229,14 +257,23 @@ impl GrowableBuffer {
                 usage: Self::effective_usage(self.usage),
                 mapped_at_creation: false,
             });
+            // Zero the freshly allocated region (wgpu does not zero storage
+            // buffers): un-written slots must read as silence. The chunked
+            // sample storage is only written up to the last sample's end -
+            // a voice that plays past it (SF2 sample_end > rendered length)
+            // would otherwise read uninitialized garbage (measured: recurring
+            // single-sample pops ~40000 in dense MIDI).
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            if new_size > self.size {
+                encoder.clear_buffer(&new_buf, self.size, Some(new_size - self.size));
+            }
             // Copy old contents (if any) into the new buffer.
             let can_copy_src = !self.usage.contains(wgpu::BufferUsages::MAP_READ);
             if self.size > 0 && can_copy_src {
-                let mut encoder =
-                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
                 encoder.copy_buffer_to_buffer(&self.buffer, 0, &new_buf, 0, self.size);
-                queue.submit(Some(encoder.finish()));
             }
+            queue.submit(Some(encoder.finish()));
             self.buffer = new_buf;
             self.size = new_size;
             queue.write_buffer(&self.buffer, offset, data);

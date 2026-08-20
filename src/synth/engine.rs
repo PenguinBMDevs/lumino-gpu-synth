@@ -49,6 +49,17 @@ const MAX_RENDER_FRAMES: u64 = 1 << 31;
 /// voices from stale states (risk of audio replay), which the user forbade.
 const STATES_SYNC_EVERY: u32 = 1;
 
+/// Headroom between the polyphony trim target and the physical GPU pool:
+/// voices trimmed for polyphony fade out over 1 ms (one block), so the
+/// pool must be able to hold the active voices PLUS one block's worth of
+/// fading voices. `max_voices` stays the *active* polyphony target (and the
+/// trim threshold); the pool is sized 1.5x so a sudden black-MIDI storm
+/// fades everything out smoothly instead of hard-killing at the cap.
+/// The fading voices are pruned by the next readback (they end after the
+/// 1 ms fade), so the surplus is transient and the pool returns to
+/// `max_voices` when the storm passes.
+const FADE_SLOTS_FRACTION: usize = 2; // pool = max_voices * (1 + 1/FRACTION)
+
 /// Hard cap for the voice output buffer (per-voice output for one block).
 /// The wgpu/D3D12-style maximum buffer size is 2 GiB - 1; staying well
 /// below it keeps headroom. `max_voices` must be chosen so the *peak*
@@ -214,6 +225,11 @@ pub struct GpuSynth {
     /// leaking raw sums to the listener. Release is a ~50 ms exponential
     /// recovery so the volume returns without pumping or block-step clicks.
     limiter_gain: f32,
+    /// Tail of the previous block's raw (pre-limiter) samples, used as the
+    /// delay line head by the lookahead limiter (see `apply_limiter`): the
+    /// output at block start is the delayed sample from the previous block,
+    /// so the 1 ms delay is continuous across blocks.
+    limiter_tail: Vec<f32>,
     // Readback staging (filled by dispatch, consumed by readback/sync).
     last_out: Option<Vec<u8>>,
     last_states: Option<Vec<u8>>,
@@ -294,6 +310,160 @@ type VoiceTemplateCache = std::collections::HashMap<VoiceTemplateKey, Vec<Voice>
 /// Per-voice diagnostic row from [`GpuSynth::debug_voices`].
 type VoiceDebugInfo = (u8, u8, f32, f32, bool, bool, u32, u32, u64, u32, f32);
 
+/// Block limiter core, factored out of `GpuSynth::apply_limiter` so it can be
+/// unit-tested without a GPU device.
+///
+/// Processes ONE stereo block (`out` is interleaved L,R,L,R...). `tail` is the
+/// previous block's last `LOOKAHEAD` stereo frames (the delay-line head,
+/// unscaled) carried across blocks; `gain` is the carried gain state. Both are
+/// updated in place for the next block.
+///
+/// The limiter delays the signal by `LOOKAHEAD` frames and applies a lookahead
+/// peak limiter so the signal never exceeds ~0.98. Crucially, the per-frame
+/// gain peak-detects the EMITTED sample stream (which reaches into `tail` for a
+/// spike that ended the previous block), so a brief single-sample transient is
+/// attenuated at the exact output frame that outputs it - this is what stops the
+/// "super-high short pop columns" that escaped the old forward-only window.
+fn limit_block(out: &mut [f32], tail: &mut Vec<f32>, gain: &mut f32, sample_rate: f32) {
+    const LOOKAHEAD: usize = 256; // frames; ~4 ms @ 64 kHz
+    let n = out.len() / 2;
+    if n == 0 {
+        return;
+    }
+    let rate = sample_rate.max(1.0);
+
+    // Pre-limiter mix (the whole block is in RAM, so the limiter can look
+    // ahead). Sanitize non-finite samples first: NaN/Inf is a corrupted
+    // artifact (e.g. a GPU compute blow-up at a chunk/segment boundary)
+    // and must not leak a "super-high short pop" through the limiter or the
+    // delay line - replace it with silence.
+    let mut raw: Vec<f32> = out.to_vec();
+    for s in raw.iter_mut() {
+        if !s.is_finite() {
+            *s = 0.0;
+        }
+    }
+
+    // Peak of this block (for the fast path and the truncated tail).
+    // `raw` is already sanitized above, so every sample is finite.
+    let mut peak = 0.0f32;
+    for &s in raw.iter() {
+        let a = s.abs();
+        peak = peak.max(a);
+    }
+
+    // `tail` holds the previous block's RAW input samples (the unscaled
+    // delay-line head): the first LOOKAHEAD output frames are those samples
+    // scaled by THIS block's gains - the gain applies at the output time,
+    // exactly like the delay line itself, so the block boundary is seamless.
+    if tail.len() < LOOKAHEAD * 2 {
+        tail.resize(LOOKAHEAD * 2, 0.0);
+    }
+
+    let mut g = *gain;
+    if peak <= 0.98 && g == 1.0 {
+        // Fast path: nothing exceeds full scale AND the gain is fully
+        // recovered - pure delay, no scaling.
+        for i in 0..n {
+            if i < LOOKAHEAD {
+                out[i * 2] = tail[i * 2];
+                out[i * 2 + 1] = tail[i * 2 + 1];
+            } else {
+                out[i * 2] = raw[(i - LOOKAHEAD) * 2];
+                out[i * 2 + 1] = raw[(i - LOOKAHEAD) * 2 + 1];
+            }
+        }
+        // The delay-line head for the next block is this block's RAW input
+        // tail (unscaled): the next block scales it with ITS gain.
+        tail.copy_from_slice(&raw[raw.len() - LOOKAHEAD * 2..]);
+        *gain = 1.0;
+        return;
+    }
+
+    let atk = 1.0 - (-1.0 / (0.0005 * rate)).exp(); // 0.5 ms attack
+    let rel = 1.0 - (-1.0 / (0.080 * rate)).exp(); // 80 ms release
+    let mut gains = vec![1.0f32; n];
+
+    // Emitted-sample stream: output frame `f` emits the previous block's
+    // delay-line `tail` for f < LOOKAHEAD, otherwise this block's `raw`
+    // shifted by LOOKAHEAD. The gain for frame `i` MUST peak-detect THIS
+    // stream around the sample it actually outputs (emit[i]) - NOT `raw`
+    // alone: a spike sitting in the last LOOKAHEAD frames of the previous
+    // block lives in `tail` and is emitted at a small `i` here, so the
+    // window has to reach into `tail` to see it.
+    let emit = |f: usize, t: &[f32], r: &[f32]| -> (f32, f32) {
+        if f < LOOKAHEAD {
+            (t[f * 2], t[f * 2 + 1])
+        } else {
+            (r[(f - LOOKAHEAD) * 2], r[(f - LOOKAHEAD) * 2 + 1])
+        }
+    };
+
+    if peak > 0.98 {
+        // Lookahead gain for EVERY frame i: g[i] approaches
+        // 0.98 / (peak of emitted samples emit[i .. i + LOOKAHEAD]).
+        //
+        // The limiter delays the signal by LOOKAHEAD frames, so the sample
+        // EMITTED at output frame `i` is emit[i]. Centring the window on
+        // emit[i] (backward half reaches into `tail` for a previous-block
+        // spike, forward half is true lookahead) guarantees a brief
+        // transient is ducked BEFORE the frame that outputs it (anticipation).
+        //
+        // The previous window `raw[i+1 .. i+LOOKAHEAD]` looked ~2*LOOKAHEAD
+        // AHEAD of the emitted sample and MISSED short spikes, so single-
+        // sample "super-high pops" escaped the limiter entirely - the bug
+        // behind the exported waveform's tall short pop columns. Both window
+        // ends truncate at the block edge, where the block peak is the safe
+        // fallback.
+        for g_i in gains.iter_mut().enumerate() {
+            let i = g_i.0;
+            let mut l = 0.0f32;
+            let start = i; // look AHEAD from the emitted sample (anticipation)
+            let end = (i + LOOKAHEAD).min(n - 1);
+            for f in start..=end {
+                let (a, b) = emit(f, &tail, &raw);
+                l = l.max(a.abs()).max(b.abs());
+            }
+            // Forward window truncated at block end: next block unseen,
+            // fall back to the block peak.
+            if end < i + LOOKAHEAD {
+                l = l.max(peak);
+            }
+            let target = if l > 0.98 { 0.98 / l } else { 1.0 };
+            let k = if target < g { atk } else { rel };
+            g += (target - g) * k;
+            *g_i.1 = g;
+        }
+    } else {
+        // Overloaded some time ago (g < 1) but this block is quiet:
+        // the gain recovers exponentially; no lookahead scan needed.
+        for g_i in gains.iter_mut() {
+            g += (1.0 - g) * rel;
+            *g_i = g;
+        }
+    }
+
+    // Apply: output[i] = delayed raw input (previous block's tail for
+    // i < LOOKAHEAD, else raw[i - LOOKAHEAD]) * gains[i], where gains[i]
+    // is THIS block's gain at output time i.
+    for i in 0..n {
+        let (l, r) = if i < LOOKAHEAD {
+            (tail[i * 2], tail[i * 2 + 1])
+        } else {
+            (raw[(i - LOOKAHEAD) * 2], raw[(i - LOOKAHEAD) * 2 + 1])
+        };
+        let gg = gains[i];
+        // Final insurance for the truncated tail window: a soft knee,
+        // never a hard flat-top.
+        let vl = if gg == 1.0 { l } else { soft_knee(l * gg) };
+        let vr = if gg == 1.0 { r } else { soft_knee(r * gg) };
+        out[i * 2] = vl;
+        out[i * 2 + 1] = vr;
+    }
+    tail.copy_from_slice(&raw[raw.len() - LOOKAHEAD * 2..]);
+    *gain = g;
+}
+
 impl GpuSynth {
     /// Creates a new synthesizer with the given configuration, initializing
     /// the GPU device (a wgpu adapter is picked automatically).
@@ -317,19 +487,25 @@ impl GpuSynth {
     pub fn with_resources(config: SynthConfig, res: GpuResources) -> Result<Self, SynthError> {
         config.validate()?;
         let device = &res.ctx.device;
+        let queue = &res.ctx.queue;
         let block = config.block_size;
         let max_voices = config.max_voices;
+        // Physical pool: active voices + room for one block's worth of
+        // fading (trimmed) voices. See `FADE_SLOTS_FRACTION`.
+        let pool = max_voices + max_voices / FADE_SLOTS_FRACTION;
 
         let params_buf = GrowableBuffer::new(
             device,
+            queue,
             "voice params",
-            (VoiceParams::SIZE * max_voices) as u64,
+            (VoiceParams::SIZE * pool) as u64,
             wgpu::BufferUsages::STORAGE,
         );
         let samples_chunks = (0..SAMPLES_CHUNKS)
             .map(|i| {
                 GrowableBuffer::with_max_capacity(
                     device,
+                    queue,
                     &format!("samples chunk {i}"),
                     1 << 20,
                     SAMPLES_CHUNK_BYTES,
@@ -350,27 +526,32 @@ impl GpuSynth {
 
         let env_buf = GrowableBuffer::new(
             device,
+            queue,
             "env stages",
-            (EnvStageGpu::SIZE * max_voices * 8) as u64,
+            (EnvStageGpu::SIZE * pool * 8) as u64,
             wgpu::BufferUsages::STORAGE,
         );
         let states_buf = GrowableBuffer::new(
             device,
+            queue,
             "voice states",
-            (VoiceState::SIZE * max_voices) as u64,
+            (VoiceState::SIZE * pool) as u64,
             wgpu::BufferUsages::STORAGE,
         );
         let voice_out_buf = GrowableBuffer::with_max_capacity(
             device,
+            queue,
             "voice out",
-            (max_voices * block * 2 * 4) as u64,
+            (pool * block * 2 * 4) as u64,
             MAX_VOICE_OUT_BYTES,
             wgpu::BufferUsages::STORAGE,
         );
         let out_storage_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("out storage"),
             size: (block * 2 * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let out_readback = [
@@ -387,28 +568,48 @@ impl GpuSynth {
                 mapped_at_creation: false,
             }),
         ];
+        // Zero the output storage and readback buffers: wgpu does not zero
+        // them, and any window where a readback is consumed before its copy
+        // (e.g. the first block of a session) would feed uninitialized
+        // garbage to the audio output (measured: recurring single-sample
+        // pops of ~40000).
+        {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            enc.clear_buffer(&out_storage_buf, 0, Some((block * 2 * 4) as u64));
+            enc.clear_buffer(&out_readback[0], 0, Some((block * 2 * 4) as u64));
+            enc.clear_buffer(&out_readback[1], 0, Some((block * 2 * 4) as u64));
+            queue.submit(Some(enc.finish()));
+        }
         let states_readback = [
             GrowableBuffer::new(
                 device,
+                queue,
                 "states readback 0",
-                (VoiceState::SIZE * max_voices) as u64,
+                (VoiceState::SIZE * pool) as u64,
                 wgpu::BufferUsages::MAP_READ,
             ),
             GrowableBuffer::new(
                 device,
+                queue,
                 "states readback 1",
-                (VoiceState::SIZE * max_voices) as u64,
+                (VoiceState::SIZE * pool) as u64,
                 wgpu::BufferUsages::MAP_READ,
             ),
         ];
         let voice_chans_buf = GrowableBuffer::new(
             device,
+            queue,
             "voice channels",
-            (max_voices * 4) as u64,
+            (pool * 4) as u64,
             wgpu::BufferUsages::STORAGE,
         );
-        let mix_events_buf =
-            GrowableBuffer::new(device, "mix events", 16 << 10, wgpu::BufferUsages::STORAGE);
+        let mix_events_buf = GrowableBuffer::new(
+            device,
+            queue,
+            "mix events",
+            16 << 10,
+            wgpu::BufferUsages::STORAGE,
+        );
         let mix_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mix params"),
             size: MixParams::SIZE as u64,
@@ -417,11 +618,11 @@ impl GpuSynth {
         });
 
         // Zero the dynamic storage buffers that are read every dispatch.
-        let zero = vec![0u8; VoiceParams::SIZE * max_voices];
+        let zero = vec![0u8; VoiceParams::SIZE * pool];
         res.ctx.queue.write_buffer(params_buf.buffer(), 0, &zero);
-        let zero = vec![0u8; VoiceState::SIZE * max_voices];
+        let zero = vec![0u8; VoiceState::SIZE * pool];
         res.ctx.queue.write_buffer(states_buf.buffer(), 0, &zero);
-        let zero = vec![0u8; EnvStageGpu::SIZE * max_voices * 8];
+        let zero = vec![0u8; EnvStageGpu::SIZE * pool * 8];
         res.ctx.queue.write_buffer(env_buf.buffer(), 0, &zero);
         let zero = vec![0u8; max_voices * 4];
         let mut voice_chans_buf = voice_chans_buf;
@@ -461,6 +662,7 @@ impl GpuSynth {
             pending_mix_events: Vec::new(),
             active_voice_count: 0,
             limiter_gain: 1.0,
+            limiter_tail: Vec::new(),
             last_out: None,
             last_states: None,
             prev_voice_ids: Vec::new(),
@@ -1446,6 +1648,7 @@ impl GpuSynth {
             voice.id = self.voice_id_counter;
             self.voice_id_counter += 1;
             voice.note_id = note_id;
+            voice.spawn_frame = self.global_frame;
             let pos = self.voices.len();
             self.voices.push(voice);
             self.key_voices
@@ -1563,17 +1766,22 @@ impl GpuSynth {
     }
 
     /// Trims one (channel, key) voice list to the `limit` loudest note
-    /// groups, marking the rest `ended` (they are dropped by the next
-    /// `retain`). Whole notes are killed, never split zones - mirroring
-    /// XSynth's `pop_quietest_voice_group`. O(key voices), so it must only
-    /// run when the key exceeds its cap, not per note-on.
+    /// groups, releasing the rest (they fade out via their release
+    /// envelope instead of being hard-killed - a hard kill makes a
+    /// sounding voice vanish in one block, an audible click at the
+    /// polyphony cap). Whole notes are released, never split zones -
+    /// mirroring XSynth's `pop_quietest_voice_group` + `fade_out_killing`.
+    /// O(key voices), so it must only run when the key exceeds its cap,
+    /// not per note-on.
     fn trim_key_voices(&mut self, ch: u8, key: u8, limit: usize) {
         let Some(positions) = self.key_voices.get(&(ch, key)).cloned() else {
             return;
         };
         // Group by note_id (spawn order keeps one note's zones adjacent);
-        // ended voices are freed for free.
-        let mut groups: Vec<(u8, Vec<usize>)> = Vec::new();
+        // ended voices are freed for free. Sort OLDEST first so a fresh
+        // note-on always survives the trim (XSynth's steal semantics: at
+        // high NPS the newest notes sound, the oldest fade out).
+        let mut groups: Vec<(u64, u8, Vec<usize>)> = Vec::new();
         let mut active = 0usize;
         for &pos in &positions {
             let Some(v) = self.voices.get(pos) else {
@@ -1584,24 +1792,30 @@ impl GpuSynth {
             }
             active += 1;
             match groups.last_mut() {
-                Some((_, g)) if self.voices[g[0]].note_id == v.note_id => g.push(pos),
-                _ => groups.push((v.vel, vec![pos])),
+                Some((_, _, g)) if self.voices[g[0]].note_id == v.note_id => g.push(pos),
+                _ => groups.push((v.spawn_frame, v.vel, vec![pos])),
             }
         }
         let need_free = active.saturating_sub(limit);
         if need_free == 0 {
             return;
         }
-        groups.sort_by_key(|&(vel, _)| vel);
+        groups.sort_by_key(|&(spawn, vel, _)| (spawn, vel));
         let mut freed = 0usize;
-        for (_, g) in &groups {
+        for (_, _, g) in &groups {
             if freed >= need_free {
                 break;
             }
             freed += g.len();
             for &pos in g {
                 if let Some(v) = self.voices.get_mut(pos) {
-                    v.state.ended = 1;
+                    if v.release_at == u64::MAX {
+                        // Release (fade out) instead of hard-ending, so the
+                        // output stays continuous at the per-key cap.
+                        v.release_at = self.global_frame;
+                        v.released = true;
+                        v.fade_out = true;
+                    }
                 }
             }
         }
@@ -1635,6 +1849,14 @@ impl GpuSynth {
     /// note of a class wins, mirroring XSynth). Runs once per block in
     /// `upload_voices` - the previous per-note-on scan was O(voices) per
     /// event and dominated black-MIDI peak blocks.
+    ///
+    /// Killed voices FADE OUT (1 ms, XSynth's `ReleaseType::Kill`) instead
+    /// of being hard-ended: a hard `ended = 1` here makes a sounding voice
+    /// vanish instantly, an audible click - and in black-MIDI exclusive
+    /// storms (the same note retriggered thousands of times) that is a
+    /// continuous crackle, the user's "800-1000 voices and it pops"
+    /// symptom. The fade stage is the release, so the voice ends 1 ms later
+    /// and the newest note still wins immediately.
     fn trim_exclusive(&mut self) {
         let mut newest: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
         for v in &self.voices {
@@ -1651,9 +1873,13 @@ impl GpuSynth {
         for v in &mut self.voices {
             if let Some(c) = v.exclusive_class
                 && v.state.ended == 0
+                && v.release_at == u64::MAX
                 && newest.get(&c).is_some_and(|&n| n != v.note_id)
             {
-                v.state.ended = 1;
+                // Fade out instead of hard-ending (see the doc above).
+                v.release_at = self.global_frame;
+                v.released = true;
+                v.fade_out = true;
             }
         }
     }
@@ -1698,39 +1924,113 @@ impl GpuSynth {
         // Drop voices that ended (state refreshed by the previous readback)
         // and rebuild the per-key index before borrowing the GPU device.
         self.voices.retain(|v| v.state.ended == 0);
-        // Global voice cap (once per block, not per note-on): `max_voices`
-        // is the GPU pool size; a pathological MIDI (black-MIDI note storms)
-        // would otherwise run the dispatch + upload far past the realtime
-        // budget. End the quietest note groups until we fit - cheap here
-        // because it runs once per block, not once per event.
-        if self.voices.len() > self.config.max_voices {
-            let over = self.voices.len() - self.config.max_voices;
+        // Global voice cap (once per block, not per note-on): the physical
+        // GPU pool (`max_voices + max_voices/FADE_SLOTS_FRACTION`) is the
+        // hard limit - a pathological MIDI (black-MIDI note storms) would
+        // otherwise run the upload past the pool buffers and crash the
+        // dispatch with a wgpu validation error. Release the quietest note
+        // groups until we fit - cheap here because it runs once per block,
+        // not once per event.
+        //
+        // Voices already fading (from an earlier trim, 1 ms = one block)
+        // are ended outright - their output has decayed, so ending them is
+        // inaudible - while fresh trims fade out instead of hard-killing
+        // (a hard kill makes a sounding voice vanish in one block, an
+        // audible click/crackle).
+        let pool = self.config.max_voices + self.config.max_voices / FADE_SLOTS_FRACTION;
+        if self.voices.len() > pool {
+            let over = self.voices.len() - pool;
             // Group voices by note in one O(n) pass (spawn order keeps one
-            // note's zones adjacent), then end whole quietest groups until
-            // the cap fits. The previous implementation re-scanned the whole
-            // voice list per group (O(over x n)) - hundreds of ms per block
-            // on black-MIDI note storms at the pool cap.
-            let mut groups: Vec<(u8, u64, Vec<usize>)> = Vec::new();
+            // note's zones adjacent), then release whole quietest groups
+            // until the cap fits. The previous implementation re-scanned
+            // the whole voice list per group (O(over x n)) - hundreds of ms
+            // per block on black-MIDI note storms at the pool cap.
+            let mut groups: Vec<(u64, u8, u64, Vec<usize>)> = Vec::new();
             for (i, v) in self.voices.iter().enumerate() {
                 match groups.last_mut() {
-                    Some((_, note, _)) if *note == v.note_id => {}
-                    _ => groups.push((v.vel, v.note_id, Vec::new())),
+                    Some((_, _, note, _)) if *note == v.note_id => {}
+                    _ => groups.push((v.spawn_frame, v.vel, v.note_id, Vec::new())),
                 }
-                groups.last_mut().unwrap().2.push(i);
+                groups.last_mut().unwrap().3.push(i);
             }
-            groups.sort_by_key(|&(vel, _, _)| vel);
+            // Oldest first: a freshly-spawned note must always sound, even
+            // at extreme NPS (XSynth's steal semantics).
+            groups.sort_by_key(|&(spawn, vel, _, _)| (spawn, vel));
+            let fade_slots = self.config.max_voices / FADE_SLOTS_FRACTION;
+            let mut fade_count = self.voices.iter().filter(|v| v.fade_out).count();
             let mut freed = 0usize;
-            for (_, _, positions) in &groups {
+            for (_, _, _, positions) in &groups {
                 if freed >= over {
                     break;
                 }
                 for &i in positions {
-                    self.voices[i].state.ended = 1;
+                    let v = &mut self.voices[i];
+                    if v.release_at == u64::MAX {
+                        if fade_count < fade_slots {
+                            // Fade out instead of hard-killing: a hard kill
+                            // makes a sounding voice vanish in one block,
+                            // an audible click/crackle. A 1 ms linear fade
+                            // (XSynth's `ReleaseType::Kill`) keeps the
+                            // output continuous and the voice ends right
+                            // after, so the pool does not accumulate tails.
+                            v.release_at = self.global_frame;
+                            v.released = true;
+                            v.fade_out = true;
+                            fade_count += 1;
+                        } else {
+                            // The fade slots are full (sustained overload):
+                            // end the voice now. It is the OLDEST survivor
+                            // (the sort above), so its output is already
+                            // decaying - inaudible.
+                            v.state.ended = 1;
+                        }
+                    } else {
+                        // Already fading: end it now (output has decayed).
+                        v.state.ended = 1;
+                    }
                     freed += 1;
                 }
             }
-            self.voices.retain(|v| v.state.ended == 0);
+            // NOTE: no retain here - the released voices stay in the pool
+            // until their release envelope ends (then the GPU marks them
+            // `ended` and the next block's readback prunes them).
         }
+
+        // Upload-capacity fallback: the physical pool buffers cannot hold
+        // more than `pool` voices, and fading voices legitimately keep
+        // occupying slots until their 1 ms fade completes. If the total
+        // (active + fading) still exceeds the pool, end fading voices -
+        // their output has already decayed, so this is inaudible. In the
+        // pathological case where even the active voices alone exceed the
+        // pool, end those too (order is preserved for the id-based state
+        // resume).
+        {
+            let pool = self.config.max_voices + self.config.max_voices / FADE_SLOTS_FRACTION;
+            if self.voices.len() > pool {
+                let mut kill = self.voices.len() - pool;
+                for v in self.voices.iter_mut() {
+                    if v.fade_out && kill > 0 {
+                        v.state.ended = 1;
+                        kill -= 1;
+                    }
+                }
+                // Pathological: active voices alone exceed the pool. Kill
+                // the OLDEST (spawn_frame), keeping fresh notes sounding.
+                if kill > 0 {
+                    let mut idx: Vec<usize> = (0..self.voices.len())
+                        .filter(|&i| self.voices[i].state.ended == 0)
+                        .collect();
+                    idx.sort_by_key(|&i| (self.voices[i].spawn_frame, self.voices[i].vel));
+                    for i in idx {
+                        if kill > 0 {
+                            self.voices[i].state.ended = 1;
+                            kill -= 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.voices.retain(|v| v.state.ended == 0);
 
         self.rebuild_key_voices();
 
@@ -1784,21 +2084,40 @@ impl GpuSynth {
             let env_base = env_stages.len() as u32;
             // Inline the env stage copy (avoids one small Vec allocation per
             // voice; dense MIDI creates tens of thousands of voices per
-            // block).
-            for s in &v.env_stages {
+            // block). Fading voices upload a single 1 ms linear stage to
+            // zero instead of their envelope (XSynth's Kill semantics).
+            if v.fade_out {
                 env_stages.push(EnvStageGpu {
-                    kind: s.kind,
-                    target_val: s.target,
-                    duration: s.duration,
+                    kind: 0, // lerp
+                    target_val: 0.0,
+                    duration: (self.config.sample_rate / 1000).max(1),
                 });
+            } else {
+                for s in &v.env_stages {
+                    env_stages.push(EnvStageGpu {
+                        kind: s.kind,
+                        target_val: s.target,
+                        duration: s.duration,
+                    });
+                }
             }
-            params[i] = v.gpu_params(
+            let mut gp = v.gpu_params(
                 sample_offset,
                 sample_offset_r,
                 env_base,
                 base,
                 self.config.interpolation,
             );
+            if v.fade_out {
+                // 1 ms fade stage is the release (entered via `release_at`,
+                // which the trim set to now); stage 1 is the terminal, so
+                // the voice ends right after the fade completes and the
+                // pool does not accumulate fading tails.
+                gp.env_count = 1;
+                gp.release_idx = 0;
+                gp.finished_idx = 1;
+            }
+            params[i] = gp;
             // A voice killed since the last upload (ended=1 set on the CPU
             // side) must stay ended: the resumed state from the previous
             // block predates the kill and would otherwise resurrect it.
@@ -1837,37 +2156,55 @@ impl GpuSynth {
         self.active_voice_count = n as u32;
         Ok(())
     }
-    fn upload_new_samples(&mut self) -> Result<(), SynthError> {
+    /// Uploads up to `max_bytes` of the given samples (resampling first,
+    /// smallest first so a small budget still completes several samples).
+    /// Returns how many samples were uploaded; the rest stay pending for
+    /// the next call. Used both by `upload_new_samples` (voice-driven) and
+    /// `prefetch_samples` (lookahead-driven, realtime playback).
+    fn upload_samples(&mut self, needed: &[usize], max_bytes: usize) -> Result<usize, SynthError> {
         let sf = match self.sf.as_mut() {
             Some(sf) => sf,
-            None => return Ok(()),
+            None => return Ok(0),
         };
+        if needed.is_empty() || max_bytes == 0 {
+            return Ok(0);
+        }
 
-        // Find samples that need uploading (both channels).
-        let mut needed: Vec<usize> = Vec::new();
-        for v in &self.voices {
-            if !self.sample_offsets.contains_key(&v.sample_id) {
-                needed.push(v.sample_id);
+        let mut ids: Vec<(usize, usize)> = needed
+            .iter()
+            .map(|&id| (id, sf.sample_data(id).len() * 4))
+            .collect();
+        ids.sort_by_key(|&(_, bytes)| bytes);
+        let mut budget = max_bytes;
+        let mut todo: Vec<usize> = Vec::new();
+        for (id, bytes) in ids {
+            if budget < bytes {
+                continue; // does not fit the remaining budget; try next time
             }
-            if !self.sample_offsets.contains_key(&v.sample_id_r) {
-                needed.push(v.sample_id_r);
-            }
+            todo.push(id);
+            budget -= bytes;
         }
-        if needed.is_empty() {
-            return Ok(());
+        if todo.is_empty() && !needed.is_empty() {
+            // No sample fits the budget (large samples): upload the smallest
+            // one anyway so progress is never zero - a single sample cannot
+            // be split across blocks.
+            let smallest = needed
+                .iter()
+                .min_by_key(|&&id| sf.sample_data(id).len())
+                .copied()
+                .unwrap();
+            todo.push(smallest);
         }
-        needed.sort_unstable();
-        needed.dedup();
+        if todo.is_empty() {
+            return Ok(0);
+        }
 
         let device = &self.res.ctx.device;
         let queue = &self.res.ctx.queue;
         let rate = self.config.sample_rate;
-
         // Resampling is the dominant CPU cost for large soundfonts; run it
         // in parallel (each sample is independent), then upload sequentially.
-        // `resample_read` hits the pre-warmed cache when available, so the
-        // render loop only pays for samples that were never used before.
-        let resampled: Vec<(usize, Arc<[f32]>)> = needed
+        let resampled: Vec<(usize, Arc<[f32]>)> = todo
             .par_iter()
             .map(|&sample_id| {
                 let data = sf.resample_read(sample_id, rate);
@@ -1892,7 +2229,61 @@ impl GpuSynth {
             self.sample_offsets.insert(sample_id, (offset, len));
             self.samples_next_offset = offset + len;
         }
+        Ok(todo.len())
+    }
+
+    /// Uploads every sample the current voices need (bounded only by the
+    /// GPU buffer). Voice-driven path; see `upload_samples`.
+    fn upload_new_samples(&mut self) -> Result<(), SynthError> {
+        let mut needed: Vec<usize> = Vec::new();
+        for v in &self.voices {
+            if !self.sample_offsets.contains_key(&v.sample_id) {
+                needed.push(v.sample_id);
+            }
+            if !self.sample_offsets.contains_key(&v.sample_id_r) {
+                needed.push(v.sample_id_r);
+            }
+        }
+        needed.sort_unstable();
+        needed.dedup();
+        self.upload_samples(&needed, usize::MAX)?;
         Ok(())
+    }
+
+    /// Realtime-playback lookahead: pre-uploads samples the event stream
+    /// will use within the next ~2 seconds, in chunks of at most
+    /// `max_bytes`, so the render thread never stalls on a multi-hundred-ms
+    /// resample+upload inside a block (which empties the audio queue and
+    /// crackles). Returns how many samples were uploaded this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SynthError::Gpu`] if a sample upload fails.
+    pub fn prefetch_samples(&mut self, max_bytes: usize) -> Result<usize, SynthError> {
+        let Some(sf) = self.sf.as_ref() else {
+            return Ok(0);
+        };
+        let horizon = self.global_frame + self.config.sample_rate as u64 * 2;
+        let mut needed: Vec<usize> = Vec::new();
+        for ev in self.offline_events.iter().skip(self.offline_cursor) {
+            if (ev.sample as u64) > horizon {
+                break;
+            }
+            if let MidiEvent::NoteOn { key, vel } = ev.event() {
+                for &zid in sf.zones_at(key, vel) {
+                    let z = sf.zone(zid);
+                    if !self.sample_offsets.contains_key(&z.sample_id) {
+                        needed.push(z.sample_id);
+                    }
+                    if !self.sample_offsets.contains_key(&z.sample_id_r) {
+                        needed.push(z.sample_id_r);
+                    }
+                }
+            }
+        }
+        needed.sort_unstable();
+        needed.dedup();
+        self.upload_samples(&needed, max_bytes)
     }
     fn update_mix_params(&mut self, base: u64) -> Result<(), SynthError> {
         let queue = &self.res.ctx.queue;
@@ -2360,59 +2751,54 @@ impl GpuSynth {
         };
         let count = (data.len() / 4).min(out.len());
         out[..count].copy_from_slice(bytemuck::cast_slice(&data[..count * 4]));
-        self.apply_limiter(out);
+        // Lookahead output limiter (skip with LUMINO_NO_LIMITER for GPU
+        // output diagnostics).
+        if std::env::var("LUMINO_NO_LIMITER").is_err() {
+            self.apply_limiter(out);
+        }
         Ok(())
     }
-
-    /// Block-level output peak limiter (see the `limiter_gain` field doc).
+    /// Lookahead output peak limiter (see the `limiter_gain` field doc).
     ///
     /// The mix pass returns the raw voice sum (f32 holds it losslessly even
-    /// at hundreds/thousands of voices). This scales the whole block by a
-    /// scalar gain, preserving the waveform exactly (a scalar gain does not
-    /// reshape the signal, unlike any per-sample saturation).
+    /// at hundreds/thousands of voices). A limiter is needed because the sum
+    /// routinely exceeds full scale at high polyphony (64 voices peak ~10x,
+    /// 800+ voices hundreds of times), and a hard clip / per-sample soft clip
+    /// flat-tops the waveform into square-wave distortion (verified
+    /// empirically, see the module history).
     ///
-    /// Attack: the target is derived from THIS block's peak (the data is
-    /// already in hand at readback) and applied to the whole block from its
-    /// first sample - an overloaded block is throttled with NO attack-lag
-    /// window, so no raw sum ever leaks to the listener.
+    /// WHY LOOKAHEAD (learned the hard way from the previous block-peak
+    /// limiter): a limiter whose gain follows the signal with a finite
+    /// response time faces a contradiction. A FAST gain (0.5 ms attack)
+    /// tracks the signal tightly but the gain change itself is a fast
+    /// multiplicative modulation of the whole mix - at 800+ live voices,
+    /// where the sum exceeds full scale almost constantly and the block peak
+    /// swings with every note, this modulation is a CONTINUOUS CRACKLE
+    /// (the "800-1000 voices and above it starts popping" report). A SLOW
+    /// gain (the other escape) avoids the modulation but lets onsets
+    /// overshoot far past full scale before the gain descends - which then
+    /// needs a deep soft clip that flat-tops the waveform again.
     ///
-    /// Release: the gain recovers exponentially (~50 ms) when the peak drops
-    /// below 0.98, so the volume returns without pumping, and the per-block
-    /// gain change is small enough that block boundaries stay click-free.
+    /// The lookahead design resolves the contradiction: the mix block is
+    /// already fully computed in RAM when the limiter runs, so the gain at
+    /// frame `i` can be derived from the PEAK OF THE NEXT 64 FRAMES (1 ms @
+    /// 64 kHz) instead of the past. The gain is therefore fully settled
+    /// BEFORE the loud samples arrive: no overshoot, no fast modulation
+    /// during onsets. The output is the mix delayed by 1 ms (a fixed,
+    /// inaudible latency - 1 ms is far below the ~10 ms humans perceive).
+    /// The gain itself still moves slowly (0.5 ms attack / 80 ms release),
+    /// so it never modulates the signal audibly.
     ///
-    /// Below the 0.98 threshold the target is 1.0 and (once recovered) the
-    /// output passes through bit-identical - reference renders never exceed
-    /// full scale, so reference comparison is unaffected.
+    /// The block's last 64 frames cannot see the next block, so their
+    /// lookahead window is truncated; if the next block opens louder than
+    /// this block's tail, a brief (< 1 ms) overshoot passes through
+    /// `soft_knee` (a slope-continuous ceiling, not a flat-top clip).
+    ///
+    /// Below the 0.98 threshold (gain at unity) the limiter reduces to a
+    /// pure 1 ms delay - the waveform is preserved bit-exactly, just shifted.
     fn apply_limiter(&mut self, out: &mut [f32]) {
-        // NaN/Inf cannot happen from finite inputs, but a guard keeps a
-        // pathological voice from poisoning the limiter into silence.
-        let mut peak = 0.0f32;
-        for &s in out.iter() {
-            let a = s.abs();
-            if a.is_finite() {
-                peak = peak.max(a);
-            }
-        }
-        // Target: pull the block peak down to 0.98 (2% headroom).
-        let target = if peak > 0.98 { 0.98 / peak } else { 1.0 };
-        // Immediate attack on overload (the block is scaled from its first
-        // sample); exponential release back to unity.
-        if target < self.limiter_gain {
-            self.limiter_gain = target;
-        } else {
-            let block_time = self.config.block_size as f32 / self.config.sample_rate.max(1) as f32;
-            let alpha = 1.0 - (-block_time / 0.05).exp();
-            self.limiter_gain += (target - self.limiter_gain) * alpha;
-        }
-
-        let g = self.limiter_gain;
-        // Skip the multiply when at unity (the common case - keeps normal
-        // renders bit-identical).
-        if g != 1.0 {
-            for s in out.iter_mut() {
-                *s *= g;
-            }
-        }
+        let sr = self.config.sample_rate as f32;
+        limit_block(out, &mut self.limiter_tail, &mut self.limiter_gain, sr);
     }
 
     /// Applies the read-back voice states to the CPU mirror.
@@ -2458,6 +2844,27 @@ impl GpuSynth {
             }
         }
     }
+}
+
+/// Slope-continuous soft ceiling for the limiter's attack window (samples
+/// that still exceed 0.98 while the gain descends).
+///
+/// `y(0.98) = 0.98` with derivative 1.0 (matches the linear region), then
+/// smoothly approaches 1.0 as `|x| -> inf`. Unlike a hard `clamp`, it never
+/// produces flat-topped square-wave harmonics; unlike a per-sample soft clip
+/// applied to the WHOLE signal it only engages above 0.98, so normal-range
+/// audio is untouched (and reference renders stay bit-identical).
+fn soft_knee(v: f32) -> f32 {
+    let x = v.abs();
+    // Below the knee the signal passes through untouched - the limiter's
+    // gain scaling already did its job there.
+    if x <= 0.98 {
+        return v;
+    }
+    // t in [0, inf); tanh(0)=0 with slope 1, so the knee is slope-continuous.
+    let t = (x - 0.98) / 0.02;
+    let y = 0.98 + 0.02 * t.tanh();
+    y.copysign(v)
 }
 
 /// Writes resampled sample bytes across the fixed-size sample chunks,
@@ -2552,5 +2959,70 @@ impl ProgressBar {
             .chain(std::iter::repeat_n(' ', self.width - filled))
             .collect();
         eprint!("\r[render] [{}] {pct:3}%", bar);
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::limit_block;
+
+    const LOOKAHEAD: usize = 256;
+
+    #[test]
+    fn limiter_kills_single_sample_spike() {
+        let n = 512usize;
+        let mut tail = vec![0.0f32; LOOKAHEAD * 2];
+        let mut gain = 1.0f32;
+        let mut out = vec![0.5f32; n * 2];
+        // Single-sample +3 spike at frame 100; the limiter delays by
+        // LOOKAHEAD so it is emitted at output frame 356.
+        out[100 * 2] = 3.0;
+        out[100 * 2 + 1] = 3.0;
+
+        limit_block(&mut out, &mut tail, &mut gain, 64000.0);
+
+        // The original forward-only window missed this spike entirely; the new
+        // window (centred on the emitted sample) must attenuate it. soft_knee
+        // caps the output at 1.0, so a surviving spike would blow past that.
+        let max_abs = out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(max_abs < 1.0, "single-sample spike not limited (max abs = {max_abs})");
+    }
+
+    #[test]
+    fn limiter_kills_end_of_block_spike_across_blocks() {
+        let n = 512usize;
+        let mut tail = vec![0.0f32; LOOKAHEAD * 2];
+        let mut gain = 1.0f32;
+        // Block 0 ends with a spike in its very last sample.
+        let mut block0 = vec![0.5f32; n * 2];
+        block0[(n - 1) * 2] = 3.0;
+        block0[(n - 1) * 2 + 1] = 3.0;
+        limit_block(&mut block0, &mut tail, &mut gain, 64000.0);
+
+        // Block 1 is quiet; the spike now lives in 	ail and is emitted near
+        // block 1's start, so the gain window must reach into the tail to see it.
+        let mut block1 = vec![0.5f32; n * 2];
+        limit_block(&mut block1, &mut tail, &mut gain, 64000.0);
+
+        for (name, b) in [("block0", &block0), ("block1", &block1)] {
+            let max_abs = b.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            assert!(max_abs < 1.0, "{name}: end-of-block spike not limited (max abs = {max_abs})");
+        }
+    }
+
+    #[test]
+    fn limiter_sanitizes_nonfinite() {
+        let n = 512usize;
+        let mut tail = vec![0.0f32; LOOKAHEAD * 2];
+        let mut gain = 1.0f32;
+        let mut out = vec![0.5f32; n * 2];
+        out[50 * 2] = f32::NAN;
+        out[50 * 2 + 1] = f32::INFINITY;
+
+        limit_block(&mut out, &mut tail, &mut gain, 64000.0);
+
+        assert!(out[50 * 2].is_finite(), "NaN was not sanitized");
+        assert!(out[50 * 2 + 1].is_finite(), "Inf was not sanitized");
+        let max_abs = out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(max_abs < 1.0, "non-finite artifact leaked a pop (max abs = {max_abs})");
     }
 }

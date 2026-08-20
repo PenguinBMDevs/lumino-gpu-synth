@@ -88,10 +88,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // Accumulate voices grouped by channel. Released voices are summed
-    // separately: XSynth's channel volume (CC7/CC11) does not affect the
-    // release tail (the reference renderer applies volume only to the active
-    // body), so released voices must skip the per-channel amp but still get
-    // the channel pan.
+    // separately so the grouping stays correct, but BOTH groups get the
+    // per-channel amp: XSynth applies the channel volume (CC7/CC11) as a
+    // post-mix gain over the WHOLE channel buffer (`apply_channel_effects`,
+    // vol^3 over every sample including release tails), so skipping the amp
+    // for released voices would step the output the moment a voice enters
+    // release (amplitude jumps from vol^2 to 1.0) - an audible click that
+    // shows up in dense MIDI as a continuous crackle.
     var acc_l: array<f32, MAX_CHANNELS>;
     var acc_r: array<f32, MAX_CHANNELS>;
     var acc_rel_l: array<f32, MAX_CHANNELS>;
@@ -168,8 +171,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let pan_l = cos(pan_angle);
         let pan_r = sin(pan_angle);
 
-        out_l = out_l + acc_l[ch] * amp * pan_l + acc_rel_l[ch] * pan_l;
-        out_r = out_r + acc_r[ch] * amp * pan_r + acc_rel_r[ch] * pan_r;
+        out_l = out_l + (acc_l[ch] + acc_rel_l[ch]) * amp * pan_l;
+        out_r = out_r + (acc_r[ch] + acc_rel_r[ch]) * amp * pan_r;
     }
 
     output[f * 2u] = out_l;

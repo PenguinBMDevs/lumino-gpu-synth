@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-use super::resample::LinearResampler;
+use super::resample::SincResampler;
 use crate::GpuSynth;
 use crate::SynthError;
 use crate::midi::MidiEvent;
@@ -268,7 +268,7 @@ impl AudioPlayback {
         // plus the render thread's catch-up burst.
         {
             let mut warm_buf = vec![0.0f32; block * channels];
-            let mut warm_resampler = LinearResampler::new(engine_rate, device_rate, channels);
+            let mut warm_resampler = SincResampler::new(engine_rate, device_rate, channels);
             for _ in 0..8 {
                 let _ = synth.render_block(&mut warm_buf);
                 let out = if needs_resample {
@@ -295,7 +295,7 @@ impl AudioPlayback {
             .spawn(move || {
                 let mut synth = synth;
                 let mut buf = vec![0.0f32; block * channels];
-                let mut resampler = LinearResampler::new(engine_rate, device_rate, channels);
+                let mut resampler = SincResampler::new(engine_rate, device_rate, channels);
                 let mut last_err = false;
                 // Max allowed render time per block: 90% of realtime so the
                 // thread runs slightly ahead and the queue accumulates a
@@ -358,6 +358,15 @@ impl AudioPlayback {
                         continue;
                     }
                     last_err = false;
+
+                    // NOTE: lookahead sample pre-upload is NOT done here.
+                    // Resampling a large SF2 sample takes ~300 ms no matter
+                    // how it is chunked (the total work is fixed), so
+                    // spreading it across blocks makes EVERY block slow
+                    // instead of a few. The correct fix is `prewarm_midi_file`
+                    // before playback (see examples/realtime_midi.rs); the
+                    // engine keeps `prefetch_samples` for callers that want
+                    // bounded incremental uploads.
                     thread_stats
                         .voice_count
                         .store(synth.voice_count() as u64, Ordering::Relaxed);
@@ -566,7 +575,7 @@ impl Drop for AudioPlayback {
 /// fails with "not supported in shared mode". The robust choice is the
 /// device's *default* configuration: it is guaranteed to open. When the
 /// device default rate differs from the engine rate, the render thread
-/// resamples (see [`LinearResampler`]). `resampled` reports that case.
+/// resamples (see [`SincResampler`]). `resampled` reports that case.
 fn negotiate_config(
     device: &cpal::Device,
     engine_rate: u32,

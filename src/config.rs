@@ -59,23 +59,27 @@ pub struct SynthConfig {
 
     /// Maximum number of concurrently active voices.
     ///
-    /// This is the size of the GPU voice pool (buffers and dispatch width),
-    /// **not** a musical polyphony limit: voices are never killed because
-    /// of it. It must be large enough to hold the peak number of voices the
-    /// MIDI can produce; for pathological files with tens of thousands of
-    /// simultaneous notes, raise it accordingly.
+    /// This is the GPU voice pool size AND the polyphony ceiling: when the
+    /// number of sounding voices would exceed it, the oldest note groups
+    /// are faded out (XSynth's `global_voice_limit` + voice stealing) so a
+    /// fresh note always sounds.
     ///
-    /// Default: `16384`.
+    /// The default (4096, like XSynth's) keeps the simultaneous-voice noise
+    /// floor low: N voices mix with ~sqrt(N) noise density, so 16k voices
+    /// sound like white noise even when the peak is limited. Raise it only
+    /// if a specific file really needs more simultaneous notes.
+    ///
+    /// Default: `4096`.
     pub max_voices: usize,
 
     /// Maximum number of simultaneous voices for the *same key* on the same
     /// channel (XSynth-style per-key polyphony limit).
     ///
     /// When a note-on would exceed this, the oldest voice of that key is
-    /// replaced, so a repeated note always steals from its own key rather
+    /// faded out, so a repeated note always steals from its own key rather
     /// than from unrelated notes. `0` disables the limit entirely.
     ///
-    /// Default: `4`.
+    /// Default: `8` (XSynth uses 4; 8 keeps fast trills/rolls clean).
     pub max_voices_per_key: usize,
 
     /// Number of audio frames rendered per GPU dispatch (per channel).
@@ -139,8 +143,8 @@ impl Default for SynthConfig {
     fn default() -> Self {
         Self {
             sample_rate: 64_000,
-            max_voices: 16_384,
-            max_voices_per_key: 32,
+            max_voices: 4_096,
+            max_voices_per_key: 8,
             block_size: 512,
             interpolation: InterpolationMode::Linear,
             use_effects: true,

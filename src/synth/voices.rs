@@ -42,6 +42,11 @@ pub struct Voice {
     pub exclusive_class: Option<u8>,
     /// Absolute global frame at which the voice becomes audible.
     pub start_at: u64,
+    /// Absolute global frame at which the voice was spawned. Polyphony
+    /// trims kill the OLDEST voices first (XSynth's steal semantics: a
+    /// freshly-spawned note must always sound), so at high NPS the newest
+    /// notes survive instead of being trimmed into silence.
+    pub spawn_frame: u64,
     /// Resampled-domain positions.
     pub positions: ZonePositions,
     /// Resampled sample length.
@@ -79,6 +84,11 @@ pub struct Voice {
     pub release_idx: u32,
     /// Index of the terminal stage.
     pub finished_idx: u32,
+    /// Whether the voice is being trimmed for polyphony and must fade out
+    /// fast (XSynth's `ReleaseType::Kill`: 1 ms linear fade to zero) instead
+    /// of using its normal release envelope. A hard kill makes a sounding
+    /// voice vanish in one block - an audible click at the polyphony cap.
+    pub fade_out: bool,
     /// Number of sample channels (1 = mono, 2 = stereo pair).
     pub channels: u32,
 }
@@ -197,14 +207,22 @@ pub fn build_voice(
         vel,
         channel,
         zone_id,
+        // New voices start their envelope at the SF2 envelope START value
+        // (XSynth: `EnvelopeParameters.start = start_percent`, the delay
+        // stage's start/target; the attack stage ramps FROM that value to
+        // 1.0). Starting from the first stage's TARGET instead would make
+        // every new voice begin at full amplitude - with thousands of
+        // simultaneous note-ons (black-MIDI) that onset step is an audible
+        // click/crackle.
         state: VoiceState {
-            env_from: env_stages.first().map_or(0.0, |s| s.target),
+            env_from: envelope_desc.start_percent,
             ..Default::default()
         },
         release_at: u64::MAX,
         released: false,
         exclusive_class: zone.exclusive_class,
         start_at,
+        spawn_frame: 0, // set by the engine when the voice is spawned
         positions,
         sample_len: 0,
         sample_id: zone.sample_id,
@@ -224,6 +242,7 @@ pub fn build_voice(
         env_release,
         release_idx,
         finished_idx,
+        fade_out: false,
         channels: zone.channels,
     })
 }
