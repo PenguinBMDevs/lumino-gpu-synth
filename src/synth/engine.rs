@@ -108,6 +108,19 @@ impl LerpState {
     }
 }
 
+/// Currently-selected RPN/NRPN parameter (target of a following CC6/CC38
+/// Data Entry). `None` means no parameter is armed, so a stray Data Entry
+/// is ignored (as required by the MIDI spec).
+#[derive(Clone, Copy, Debug, Default)]
+enum ParamSel {
+    #[default]
+    None,
+    /// Registered Parameter Number: `(msb, lsb)`.
+    Rpn(u8, u8),
+    /// Non-Registered Parameter Number: `(msb, lsb)`.
+    Nrpn(u8, u8),
+}
+
 /// Per-channel MIDI state.
 #[derive(Debug)]
 struct ChannelState {
@@ -121,6 +134,21 @@ struct ChannelState {
     env_attack: Option<u8>,
     /// CC72 (release) value affecting voices of this channel.
     env_release: Option<u8>,
+    // ---- Pitch state (driven by Pitch Bend + RPN 0/1/2) ----
+    /// Last 14-bit pitch-bend value (0..16383, center 8192).
+    bend_value: i32,
+    /// Pitch-bend sensitivity in semitones, set via RPN 0 (default 2.0, GM).
+    bend_sensitivity: f32,
+    /// Channel fine tuning in cents (RPN 1, 14-bit, center = 0).
+    fine_cents: f32,
+    /// Channel coarse tuning in cents (RPN 2, MSB semitones, center = 0).
+    coarse_cents: f32,
+    /// Parameter currently selected for Data Entry (RPN/NRPN).
+    param: ParamSel,
+    /// Most recent CC6 (Data Entry MSB) value.
+    data_msb: u8,
+    /// Most recent CC38 (Data Entry LSB) value.
+    data_lsb: u8,
 }
 
 impl ChannelState {
@@ -134,6 +162,52 @@ impl ChannelState {
             pitch_multiplier: 1.0,
             env_attack: None,
             env_release: None,
+            bend_value: 8192,
+            bend_sensitivity: 2.0,
+            fine_cents: 0.0,
+            coarse_cents: 0.0,
+            param: ParamSel::None,
+            data_msb: 0,
+            data_lsb: 0,
+        }
+    }
+
+    /// Recomputes `pitch_multiplier` from the current bend value/sensitivity
+    /// and channel tuning (RPN 1/2).
+    fn recompute_pitch(&mut self) {
+        let bend_semitones =
+            (self.bend_value as f32 - 8192.0) / 8192.0 * self.bend_sensitivity;
+        let bend_mult = 2.0f32.powf(bend_semitones / 12.0);
+        let tune_mult = 2.0f32.powf((self.fine_cents + self.coarse_cents) / 1200.0);
+        self.pitch_multiplier = bend_mult * tune_mult;
+    }
+
+    /// Applies the current Data Entry bytes (`data_msb`/`data_lsb`) to the
+    /// selected RPN. Only RPN 0 (pitch-bend sensitivity), RPN 1 (fine tuning)
+    /// and RPN 2 (coarse tuning) affect pitch; NRPNs are left to the
+    /// soundfont/synth-specific path.
+    fn apply_rpn_data(&mut self) {
+        let data = ((self.data_msb as u16) << 7) | (self.data_lsb as u16);
+        match self.param {
+            ParamSel::Rpn(0, 0) => {
+                // Pitch Bend Sensitivity: MSB = semitones, LSB = fractional
+                // semitone. Per GM the valid range is 0..24 semitones; clamp
+                // defensively without starving legitimate wide settings.
+                let semis = self.data_msb as f32 + self.data_lsb as f32 / 128.0;
+                self.bend_sensitivity = semis.clamp(0.0, 96.0);
+                self.recompute_pitch();
+            }
+            ParamSel::Rpn(0, 1) => {
+                // Channel Fine Tuning: 14-bit, 8192 = 0 cents, range +-100 cents.
+                self.fine_cents = ((data as f32 - 8192.0) / 8192.0) * 100.0;
+                self.recompute_pitch();
+            }
+            ParamSel::Rpn(0, 2) => {
+                // Channel Coarse Tuning: MSB = semitones, 64 = 0.
+                self.coarse_cents = (self.data_msb as f32 - 64.0) * 100.0;
+                self.recompute_pitch();
+            }
+            _ => {}
         }
     }
 }
@@ -1491,19 +1565,13 @@ impl GpuSynth {
                 Ok(())
             }
             MidiEvent::PitchBend { value } => {
-                // 14-bit value: 0..16383, center 8192; sensitivity 2 semitones.
-                let bend_semitones = (value as f32 - 8192.0) / 8192.0 * 2.0;
-                let pitch_mult = 2.0f32.powf(bend_semitones / 12.0);
-                self.channels[ch].pitch_multiplier = pitch_mult;
-                // Propagate to active voices of this channel.
-                if let Some(sf) = self.sf.as_ref() {
-                    for v in &mut self.voices {
-                        if v.channel as usize == ch {
-                            let zone = sf.zone(v.zone_id);
-                            v.speed = zone.speed_mult * pitch_mult;
-                        }
-                    }
-                }
+                // 14-bit value: 0..16383, center 8192. The sensitivity comes
+                // from RPN 0 (Pitch Bend Sensitivity), defaulting to 2
+                // semitones; store the raw value and recompute so a later RPN
+                // change re-scales the held bend correctly.
+                self.channels[ch].bend_value = value as i32;
+                self.channels[ch].recompute_pitch();
+                self.propagate_channel_pitch(ch);
                 Ok(())
             }
         }
@@ -1693,6 +1761,7 @@ impl GpuSynth {
 
     fn apply_cc(&mut self, ch: usize, controller: u8, value: u8) {
         let sr = self.config.sample_rate;
+        let mut pitch_dirty = false;
         match controller {
             // CC7 (volume), CC11 (expression), CC10/CC8 (pan) are handled by
             // `handle_event` -> `defer_mix_cc` for frame-exact application;
@@ -1706,6 +1775,51 @@ impl GpuSynth {
                 // (voice resonance comes from the soundfont), but tracked for
                 // completeness.
                 let _ = value;
+            }
+            // ---- RPN / NRPN selection (pitch-critical) ----
+            0x64 => {
+                // CC100: RPN MSB.
+                let inner = match self.channels[ch].param {
+                    ParamSel::Rpn(_, l) => l,
+                    _ => 0,
+                };
+                self.channels[ch].param = ParamSel::Rpn(value, inner);
+            }
+            0x65 => {
+                // CC101: RPN LSB.
+                let inner = match self.channels[ch].param {
+                    ParamSel::Rpn(m, _) => m,
+                    _ => 0,
+                };
+                self.channels[ch].param = ParamSel::Rpn(inner, value);
+            }
+            0x62 => {
+                // CC98: NRPN MSB.
+                let inner = match self.channels[ch].param {
+                    ParamSel::Nrpn(_, l) => l,
+                    _ => 0,
+                };
+                self.channels[ch].param = ParamSel::Nrpn(value, inner);
+            }
+            0x63 => {
+                // CC99: NRPN LSB.
+                let inner = match self.channels[ch].param {
+                    ParamSel::Nrpn(m, _) => m,
+                    _ => 0,
+                };
+                self.channels[ch].param = ParamSel::Nrpn(inner, value);
+            }
+            0x06 => {
+                // CC6: Data Entry MSB (RPN/NRPN).
+                self.channels[ch].data_msb = value;
+                self.channels[ch].apply_rpn_data();
+                pitch_dirty = true;
+            }
+            0x26 => {
+                // CC38: Data Entry LSB (RPN/NRPN).
+                self.channels[ch].data_lsb = value;
+                self.channels[ch].apply_rpn_data();
+                pitch_dirty = true;
             }
             0x48 => {
                 // Release time (CC72): modifies the release envelope stage.
@@ -1747,6 +1861,7 @@ impl GpuSynth {
             0x79 => {
                 // Reset all controllers.
                 self.channels[ch] = ChannelState::new();
+                pitch_dirty = true;
             }
             0x7B => {
                 // All notes off.
@@ -1762,6 +1877,26 @@ impl GpuSynth {
                 self.rebuild_key_voices();
             }
             _ => {}
+        }
+        if pitch_dirty {
+            self.propagate_channel_pitch(ch);
+        }
+    }
+
+    /// Recomputes a channel's `pitch_multiplier` is already done in
+    /// `ChannelState`; this pushes the new multiplier onto every *active*
+    /// voice of the channel so a bend-sensitivity or tuning change takes
+    /// effect on sounding notes immediately (otherwise only future note-ons
+    /// would track it, and held notes would sit at the old pitch).
+    fn propagate_channel_pitch(&mut self, ch: usize) {
+        if let Some(sf) = self.sf.as_ref() {
+            let mult = self.channels[ch].pitch_multiplier;
+            for v in &mut self.voices {
+                if v.channel as usize == ch {
+                    let zone = sf.zone(v.zone_id);
+                    v.speed = zone.speed_mult * mult;
+                }
+            }
         }
     }
 
@@ -2963,7 +3098,7 @@ impl ProgressBar {
 }
 #[cfg(test)]
 mod tests {
-    use super::limit_block;
+    use super::{limit_block, ChannelState, ParamSel};
 
     const LOOKAHEAD: usize = 256;
 
@@ -3024,5 +3159,79 @@ mod tests {
         assert!(out[50 * 2 + 1].is_finite(), "Inf was not sanitized");
         let max_abs = out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
         assert!(max_abs < 1.0, "non-finite artifact leaked a pop (max abs = {max_abs})");
+    }
+
+    #[test]
+    fn rpn_pitch_bend_sensitivity_24() {
+        let mut st = ChannelState::new();
+        // RPN 0 (Pitch Bend Sensitivity) selected, then Data Entry = 24 semitones
+        // -- exactly what right-example.mid sends via CC100/101/6.
+        st.param = ParamSel::Rpn(0, 0);
+        st.data_msb = 24;
+        st.data_lsb = 0;
+        st.apply_rpn_data();
+        assert!(
+            (st.bend_sensitivity - 24.0).abs() < 1e-3,
+            "bend sensitivity = {} (expected 24)",
+            st.bend_sensitivity
+        );
+
+        // Bend value 9000 (above center 8192) must now map to ~2.36 semitones,
+        // not the old hardcoded 2-semitone value (~0.197 semitones). This is the
+        // "severe detuning" bug: every bend was scaled ~12x too small.
+        st.bend_value = 9000;
+        st.recompute_pitch();
+        let expected = 2.0f32.powf(((9000.0 - 8192.0) / 8192.0 * 24.0) / 12.0);
+        assert!(
+            (st.pitch_multiplier - expected).abs() < 1e-4,
+            "mult = {} (expected {})",
+            st.pitch_multiplier,
+            expected
+        );
+        // Sanity: clearly shifted up, far beyond the old 2-semitone scaling.
+        assert!(
+            st.pitch_multiplier > 1.1,
+            "bend not scaled by 24 semitones (mult = {})",
+            st.pitch_multiplier
+        );
+    }
+
+    #[test]
+    fn rpn_default_sensitivity_is_2() {
+        let st = ChannelState::new();
+        assert!((st.bend_sensitivity - 2.0).abs() < 1e-3, "default sensitivity must be 2 semitones (GM)");
+    }
+
+    #[test]
+    fn rpn_channel_tuning() {
+        let mut st = ChannelState::new();
+        // RPN 2 (coarse tuning) = +3 semitones (MSB 67, center 64).
+        st.param = ParamSel::Rpn(0, 2);
+        st.data_msb = 67;
+        st.data_lsb = 0;
+        st.apply_rpn_data();
+        st.recompute_pitch();
+        let expected = 2.0f32.powf(3.0 / 12.0);
+        assert!(
+            (st.pitch_multiplier - expected).abs() < 1e-4,
+            "coarse mult = {} (expected {})",
+            st.pitch_multiplier,
+            expected
+        );
+
+        // RPN 1 (fine tuning) = +50 cents (14-bit: 8192 + 0.5*8192 = 12288).
+        st.param = ParamSel::Rpn(0, 1);
+        st.data_msb = (12288 >> 7) as u8;
+        st.data_lsb = (12288 & 0x7f) as u8;
+        st.apply_rpn_data();
+        st.recompute_pitch();
+        // Total tuning = +3 semitones + 50 cents.
+        let expected2 = 2.0f32.powf((300.0 + 50.0) / 1200.0);
+        assert!(
+            (st.pitch_multiplier - expected2).abs() < 1e-4,
+            "fine+coarse mult = {} (expected {})",
+            st.pitch_multiplier,
+            expected2
+        );
     }
 }
