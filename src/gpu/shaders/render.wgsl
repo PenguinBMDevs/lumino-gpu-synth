@@ -107,11 +107,12 @@ fn env_eval(kind: u32, from_val: f32, target_val: f32, f_in: f32) -> f32 {
 }
 
 // Reads one f32 from the chunked samples buffer; out-of-bounds reads
-// yield 0.0.
+// yield 0.0. CHUNK_F32 = 1<<28, so shift/mask is cheaper than div/mod
+// (flame graph: raw_sample is hottest GPU function at 25k voices).
 fn raw_sample(offset: u32, idx: u32) -> f32 {
     let i = offset + idx;
-    let chunk = i / CHUNK_F32;
-    let off = i % CHUNK_F32;
+    let chunk = i >> 28u;
+    let off = i & 268435455u;
     if (chunk == 0u) {
         if (off < arrayLength(&samples0)) { return samples0[off]; }
         return 0.0;

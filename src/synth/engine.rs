@@ -1644,9 +1644,11 @@ impl GpuSynth {
         // O(1) bail-out for orphan note-offs (no active note group on this
         // key): black-MIDI peaks fire hundreds of thousands of these per
         // block and the key scan below would dominate the block time.
-        if std::env::var("LUMINO_NO_ACTIVE").is_err()
-            && self.active_notes[ch * 128 + key as usize] == 0
-        {
+        // Flame graph: `std::env::var` per note-off cost ~12% of apply
+        // (200k calls/block). Cache it once.
+        static NO_ACTIVE_BYPASS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let bypass = *NO_ACTIVE_BYPASS.get_or_init(|| std::env::var("LUMINO_NO_ACTIVE").is_ok());
+        if !bypass && self.active_notes[ch * 128 + key as usize] == 0 {
             return Ok(());
         }
         let damper = self.channels[ch].damper;
