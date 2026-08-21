@@ -238,7 +238,8 @@ impl AudioPlayback {
                                     let ms = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
-                                        .as_millis() as i64;
+                                        .as_millis()
+                                        as i64;
                                     let prev = LAST_UD_LOG.fetch_max(ms, Ordering::Relaxed);
                                     if ms - prev > 500 {
                                         eprintln!(

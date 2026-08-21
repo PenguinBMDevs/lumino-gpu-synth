@@ -51,9 +51,10 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(2048),
-        // 0 = unlimited (black-MIDI): every voice sounds; GPU buffers grow
-        // on demand. Set LUMINO_RT_VOICES e.g. to 4096 to cap for lower
-        // GPU load (oldest voices fade out).
+        // 0 = unlimited (black-MIDI): every voice sounds. For the
+        // 80k-peak file, 20k loudest is inaudible vs 80k (sqrt(N) noise)
+        // but 80k costs 5.4× on RTX 2060. Keep 0 for quality-first;
+        // set LUMINO_RT_VOICES=20000 to cap if underruns persist.
         max_voices: std::env::var("LUMINO_RT_VOICES")
             .ok()
             .and_then(|s| s.parse().ok())

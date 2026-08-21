@@ -14,7 +14,7 @@ use crate::gpu::{
     SAMPLES_CHUNK_BINDING_BASE, SAMPLES_CHUNK_BYTES, SAMPLES_CHUNKS, VoiceParams, VoiceState,
     create_gpu_context,
 };
-use crate::midi::{MidiEvent, MidiFile, TimedEvent};
+use crate::midi::{MidiEvent, MidiFile, MidiStream, TimedEvent};
 use crate::soundfont::SoundFont;
 use crate::synth::voices::{Voice, build_voice, refresh_env_stages};
 
@@ -178,8 +178,7 @@ impl ChannelState {
     /// Recomputes `pitch_multiplier` from the current bend value/sensitivity
     /// and channel tuning (RPN 1/2).
     fn recompute_pitch(&mut self) {
-        let bend_semitones =
-            (self.bend_value as f32 - 8192.0) / 8192.0 * self.bend_sensitivity;
+        let bend_semitones = (self.bend_value as f32 - 8192.0) / 8192.0 * self.bend_sensitivity;
         let bend_mult = 2.0f32.powf(bend_semitones / 12.0);
         let tune_mult = 2.0f32.powf((self.fine_cents + self.coarse_cents) / 1200.0);
         self.pitch_multiplier = bend_mult * tune_mult;
@@ -1509,6 +1508,291 @@ impl GpuSynth {
     }
 
     // ------------------------------------------------------------------
+    // Streaming offline render — zero `Vec<TimedEvent>` / zero full-sample Vec
+    // ------------------------------------------------------------------
+
+    fn apply_events_streaming(
+        &mut self,
+        stream: &mut MidiStream,
+        end: u64,
+    ) -> Result<(), SynthError> {
+        while let Some(ev) = self.pending_events.pop_front() {
+            self.handle_event(ev)?;
+        }
+        while let Some(ev) = stream.peek() {
+            if ev.sample as u64 >= end {
+                break;
+            }
+            let ev = stream.next_event().expect("peeked event must exist");
+            self.handle_event(ev)?;
+        }
+        Ok(())
+    }
+
+    fn render_block_streaming(
+        &mut self,
+        out: &mut [f32],
+        stream: &mut MidiStream,
+    ) -> Result<(), SynthError> {
+        let block = self.config.block_size;
+        let chs = self.output_channels();
+        if out.len() < block * chs {
+            return Err(SynthError::Config("output buffer too small".into()));
+        }
+        let base = self.global_frame;
+        self.apply_events_streaming(stream, base + block as u64)?;
+        self.collect_pending_readback()?;
+        if self.voices.is_empty() {
+            self.update_mix_params(base)?;
+            if let Some(data) = self.last_out.take() {
+                let count = (data.len() / 4).min(block * chs);
+                out[..count].copy_from_slice(bytemuck::cast_slice(&data[..count * 4]));
+                if count < block * chs {
+                    out[count..block * chs].fill(0.0);
+                }
+            } else {
+                out[..block * chs].fill(0.0);
+            }
+            self.apply_limiter(&mut out[..block * chs]);
+            self.global_frame += block as u64;
+            return Ok(());
+        }
+        self.sync_voice_states();
+        self.upload_voices(base)?;
+        self.upload_new_samples()?;
+        self.update_mix_params(base)?;
+        self.dispatch(base)?;
+        self.readback(out)?;
+        self.global_frame += block as u64;
+        Ok(())
+    }
+
+    /// Streaming offline render that writes directly to `wav_path` without
+    /// ever holding the MIDI event array or the full sample buffer in memory.
+    ///
+    /// The MIDI file is consumed via [`MidiStream`] (heap-merged, 8 bytes
+    /// saved per event vs `MidiFile`) and audio is flushed block-by-block
+    /// through [`crate::audio::wav::WavStreamWriter`]. Peak memory is
+    /// therefore `O(tracks + block)` instead of `O(events + samples)`.
+    pub fn render_midi_to_wav_streaming(
+        &mut self,
+        midi_path: impl AsRef<std::path::Path>,
+        wav_path: impl AsRef<std::path::Path>,
+        limit_frames: Option<u64>,
+    ) -> Result<RenderResult, SynthError> {
+        // Reset state exactly like `render_midi_inner`
+        self.offline_cursor = 0;
+        self.offline_events = Vec::new();
+        self.voices.clear();
+        for q in self.key_voices.iter_mut() {
+            q.clear();
+        }
+        self.spawn_budget = [0; 16 * 128];
+        self.active_notes = [0; 16 * 128];
+        self.global_frame = 0;
+        self.active_voice_count = 0;
+        self.last_states = None;
+        self.last_out = None;
+        self.prev_voice_ids.clear();
+        self.pending = None;
+        self.pending_events.clear();
+        self.pending_mix_events.clear();
+
+        let prof = std::env::var("LUMINO_PROFILE").is_ok();
+        let t0 = std::time::Instant::now();
+        let mut stream = MidiStream::open(midi_path.as_ref(), self.config.sample_rate)?;
+        let t1 = std::time::Instant::now();
+        // Pre-warm: scan once to collect wanted samples and upload them in
+        // parallel, exactly like `render_midi_inner`. Streaming without this
+        // produced 299 sample diffs at 0.47s on right-example.mid (512 block)
+        // due to lazy per-block sample uploads racing the pipeline.
+        // We scan the already-opened `stream` and then `rewind` it, so the
+        // file is parsed only once (the old double-open cost 800 MB extra I/O
+        // on black MIDI).
+        if self.sf.is_some() {
+            let mut wanted: Vec<usize> = Vec::new();
+            {
+                let sf_ref = self.sf.as_ref().expect("soundfont present");
+                while let Some(ev) = stream.next_event() {
+                    if let crate::midi::MidiEvent::NoteOn { key, vel } = ev.event() {
+                        for &zid in sf_ref.zones_at(key, vel) {
+                            let z = sf_ref.zone(zid);
+                            wanted.push(z.sample_id);
+                            wanted.push(z.sample_id_r);
+                        }
+                    }
+                }
+                wanted.sort_unstable();
+                wanted.dedup();
+            }
+            if !wanted.is_empty() {
+                let rate = self.config.sample_rate;
+                let sf_ref = self.sf.as_ref().expect("soundfont present");
+                let pre: Vec<(usize, Arc<[f32]>)> = wanted
+                    .par_iter()
+                    .map(|&id| (id, sf_ref.resample_uncached(id, rate)))
+                    .collect();
+                let sf_mut = self.sf.as_mut().expect("soundfont present");
+                let device = &self.res.ctx.device;
+                let queue = &self.res.ctx.queue;
+                let mut grown = false;
+                for (id, data) in pre {
+                    sf_mut.cache_resampled(id, rate, data.clone());
+                    let len = data.len() as u32;
+                    let offset = self.samples_next_offset;
+                    grown |= write_samples(
+                        &mut self.samples_chunks,
+                        device,
+                        queue,
+                        offset as u64 * 4,
+                        bytemuck::cast_slice(&data),
+                    )?;
+                    self.sample_offsets.insert(id, (offset, len));
+                    self.samples_next_offset = offset + len;
+                }
+                if grown {
+                    self.render_bg_dirty = true;
+                }
+            }
+            stream.rewind();
+        }
+
+        let events_end = stream.end_sample();
+        let tail_budget =
+            (self.config.max_tail_seconds as f64 * self.config.sample_rate as f64) as u64;
+        let max_frames = match limit_frames {
+            Some(n) => n.min(MAX_RENDER_FRAMES),
+            None => events_end
+                .saturating_add(tail_budget)
+                .min(MAX_RENDER_FRAMES),
+        };
+        let limited = limit_frames.is_some();
+        let block = self.config.block_size;
+        let chs = self.output_channels();
+        let threshold = self.config.render_silence_threshold;
+        let mut writer = crate::audio::wav::WavStreamWriter::create(
+            wav_path.as_ref(),
+            self.config.sample_rate,
+            chs as u16,
+        )?;
+        let mut block_buf = vec![0.0f32; block * chs];
+        let mut progress = ProgressBar::new(max_frames, self.config.show_progress);
+        let mut first_block = true;
+
+        // Phase 1: events + decay interleaved, streaming block by block
+        loop {
+            let events_done = stream.is_exhausted();
+            if events_done && self.voices.is_empty() {
+                if prof {
+                    eprintln!(
+                        "[render-stream] break: events_done+empty at frame {}",
+                        self.global_frame
+                    );
+                }
+                break;
+            }
+            let rb_t0 = std::time::Instant::now();
+            self.render_block_streaming(&mut block_buf, &mut stream)?;
+            let rb_dt = rb_t0.elapsed();
+            progress.tick(self.global_frame);
+            let silent = block_buf.iter().all(|s| s.abs() <= threshold);
+            if rb_dt.as_millis() > 30 {
+                eprintln!(
+                    "[slow-block-stream] frame={} render={:?} silent={} voices={}",
+                    self.global_frame,
+                    rb_dt,
+                    silent,
+                    self.voices.len()
+                );
+            }
+            if events_done && silent {
+                if prof {
+                    eprintln!(
+                        "[render-stream] break: events_done+silent at frame {}",
+                        self.global_frame
+                    );
+                }
+                break;
+            }
+            if !first_block {
+                writer.write_samples(&block_buf)?;
+            }
+            first_block = false;
+            if self.global_frame >= max_frames {
+                if limited {
+                    break;
+                }
+                return Err(self.render_timeout(&block_buf));
+            }
+        }
+
+        // Phase 2: tail
+        loop {
+            self.render_block_streaming(&mut block_buf, &mut stream)?;
+            progress.tick(self.global_frame);
+            let silent = block_buf.iter().all(|s| s.abs() <= threshold);
+            if silent {
+                break;
+            }
+            if self.global_frame >= max_frames {
+                if !limited {
+                    return Err(self.render_timeout(&block_buf));
+                }
+                if (self.global_frame - block as u64) < max_frames {
+                    writer.write_samples(&block_buf)?;
+                }
+                break;
+            }
+            writer.write_samples(&block_buf)?;
+        }
+
+        // Drain pipeline
+        self.render_block_streaming(&mut block_buf, &mut stream)?;
+        if block_buf.iter().any(|s| s.abs() > threshold) {
+            writer.write_samples(&block_buf)?;
+        }
+        let frames = writer.frames_written();
+        writer.finalize()?;
+        progress.finish();
+
+        if prof {
+            let t2 = std::time::Instant::now();
+            eprintln!(
+                "[profile-stream] midi load: {:?}, render loops: {:?}, flush: {:?}",
+                t1 - t0,
+                t2 - t1,
+                t2.elapsed()
+            );
+        }
+
+        Ok(RenderResult {
+            samples: Vec::new(),
+            sample_rate: self.config.sample_rate,
+            channels: chs as u32,
+            frames,
+        })
+    }
+
+    /// Convenience: streaming render of a whole file to `wav_path`.
+    pub fn render_midi_file_to_wav_streaming(
+        &mut self,
+        midi_path: impl AsRef<std::path::Path>,
+        wav_path: impl AsRef<std::path::Path>,
+    ) -> Result<RenderResult, SynthError> {
+        self.render_midi_to_wav_streaming(midi_path, wav_path, None)
+    }
+
+    /// Convenience: streaming render of the first `frames` frames to `wav_path`.
+    pub fn render_midi_frames_to_wav_streaming(
+        &mut self,
+        midi_path: impl AsRef<std::path::Path>,
+        wav_path: impl AsRef<std::path::Path>,
+        frames: u64,
+    ) -> Result<RenderResult, SynthError> {
+        self.render_midi_to_wav_streaming(midi_path, wav_path, Some(frames))
+    }
+
+    // ------------------------------------------------------------------
     // Internals
     // ------------------------------------------------------------------
 
@@ -1560,7 +1844,7 @@ impl GpuSynth {
                 // `max_voices_per_key` can survive the per-key trim.
                 let limit = self.config.max_voices_per_key;
                 if limit > 0 {
-                    const BUDGET_MULT: u8 = 4;
+                    const BUDGET_MULT: u8 = 1;
                     let slot = &mut self.spawn_budget[ch * 128 + key as usize];
                     if *slot >= (limit as u8).saturating_mul(BUDGET_MULT) {
                         return Ok(());
@@ -1584,8 +1868,8 @@ impl GpuSynth {
                 // a very large budget (200k) to avoid a pathological 10M note
                 // burst stalling the render thread for seconds.
                 if self.config.max_voices != 0 {
-                    let pool = self.config.max_voices
-                        + self.config.max_voices / FADE_SLOTS_FRACTION;
+                    let pool =
+                        self.config.max_voices + self.config.max_voices / FADE_SLOTS_FRACTION;
                     if self.voices.len() >= pool + pool {
                         return Ok(());
                     }
@@ -1976,7 +2260,7 @@ impl GpuSynth {
             let Some(v) = self.voices.get(pos) else {
                 continue;
             };
-            if v.state.ended != 0 {
+            if v.state.ended != 0 || v.release_at != u64::MAX {
                 continue;
             }
             active += 1;
@@ -1985,35 +2269,49 @@ impl GpuSynth {
                 _ => groups.push((v.spawn_frame, v.vel, vec![pos])),
             }
         }
-        let need_free = active.saturating_sub(limit);
+        // `active` is voices, but limit is groups — convert: groups = ceil(active / avg_voices_per_group)
+        // For per-key, limit is groups, so need_free groups = groups.len() - limit
+        let need_free = groups.len().saturating_sub(limit);
         if need_free == 0 {
             return;
         }
         groups.sort_by_key(|&(spawn, vel, _)| (spawn, vel));
         let mut freed = 0usize;
+        // For dense black MIDI (>20k), hard-kill is inaudible (dense mix
+        // masks the 1-block click) but saves 1 block of fading voices
+        // (20k * 32ms tail = 640k voice-blocks). Flame showed fading
+        // accumulation is the 80k→70k leak.
+        let hard_kill = self.voices.len() > 20000;
         for (_, _, g) in &groups {
             if freed >= need_free {
                 break;
             }
-            freed += g.len();
+            freed += 1;
             for &pos in g {
                 if let Some(v) = self.voices.get_mut(pos) {
-                    if v.release_at == u64::MAX {
-                        // Release (fade out) instead of hard-ending, so the
-                        // output stays continuous at the per-key cap.
-                        v.release_at = self.global_frame;
-                        v.released = true;
-                        v.fade_out = true;
+                    if v.release_at == u64::MAX && v.state.ended == 0 {
+                        if hard_kill {
+                            v.state.ended = 1;
+                        } else {
+                            v.release_at = self.global_frame;
+                            v.released = true;
+                            v.fade_out = true;
+                        }
                     }
                 }
             }
         }
-        // Compact the key index: drop ended entries so per-event scans
-        // (release_key, further trims) stay bounded by the cap.
+        // Compact the key index: drop ended and fading entries so
+        // per-event scans (release_key, further trims) stay bounded by the
+        // cap. Fading voices remain in `voices` for GPU but are not per-key.
         let kept: VecDeque<usize> = positions
             .iter()
             .copied()
-            .filter(|&pos| self.voices.get(pos).is_some_and(|v| v.state.ended == 0))
+            .filter(|&pos| {
+                self.voices
+                    .get(pos)
+                    .is_some_and(|v| v.state.ended == 0 && v.release_at == u64::MAX)
+            })
             .collect();
         self.key_voices[idx] = kept;
         // Rebuild this key's active-note count exactly. Decrementing by the
@@ -2101,7 +2399,26 @@ impl GpuSynth {
                 .key_voices
                 .iter()
                 .enumerate()
-                .filter(|(_, positions)| positions.len() > per_key_limit)
+                .filter(|(_, positions)| {
+                    if positions.is_empty() {
+                        return false;
+                    }
+                    // Count distinct note groups (XSynth semantics), not voices
+                    let mut groups = 0usize;
+                    let mut last_nid: Option<u64> = None;
+                    for &pos in positions.iter() {
+                        if let Some(v) = self.voices.get(pos) {
+                            if Some(v.note_id) != last_nid {
+                                groups += 1;
+                                last_nid = Some(v.note_id);
+                                if groups > per_key_limit {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    false
+                })
                 .map(|(idx, _)| ((idx / 128) as u8, (idx % 128) as u8))
                 .collect();
             for (ch, key) in keys {
@@ -2127,67 +2444,64 @@ impl GpuSynth {
         // inaudible - while fresh trims fade out instead of hard-killing
         // (a hard kill makes a sounding voice vanish in one block, an
         // audible click/crackle).
-        // In unlimited mode (max_voices == 0) the cap is disabled: every
-        // voice is rendered, buffers grow on demand and the only remaining
-        // bound is the batched dispatch window (MAX_VOICE_OUT_BYTES).
         if self.config.max_voices != 0 {
             let pool = self.config.max_voices + self.config.max_voices / FADE_SLOTS_FRACTION;
             if self.voices.len() > pool {
-            let over = self.voices.len() - pool;
-            // Group voices by note in one O(n) pass (spawn order keeps one
-            // note's zones adjacent), then release whole quietest groups
-            // until the cap fits. The previous implementation re-scanned
-            // the whole voice list per group (O(over x n)) - hundreds of ms
-            // per block on black-MIDI note storms at the pool cap.
-            let mut groups: Vec<(u64, u8, u64, Vec<usize>)> = Vec::new();
-            for (i, v) in self.voices.iter().enumerate() {
-                match groups.last_mut() {
-                    Some((_, _, note, _)) if *note == v.note_id => {}
-                    _ => groups.push((v.spawn_frame, v.vel, v.note_id, Vec::new())),
+                let over = self.voices.len() - pool;
+                // Group voices by note in one O(n) pass (spawn order keeps one
+                // note's zones adjacent), then release whole quietest groups
+                // until the cap fits. The previous implementation re-scanned
+                // the whole voice list per group (O(over x n)) - hundreds of ms
+                // per block on black-MIDI note storms at the pool cap.
+                let mut groups: Vec<(u64, u8, u64, Vec<usize>)> = Vec::new();
+                for (i, v) in self.voices.iter().enumerate() {
+                    match groups.last_mut() {
+                        Some((_, _, note, _)) if *note == v.note_id => {}
+                        _ => groups.push((v.spawn_frame, v.vel, v.note_id, Vec::new())),
+                    }
+                    groups.last_mut().unwrap().3.push(i);
                 }
-                groups.last_mut().unwrap().3.push(i);
-            }
-            // Oldest first: a freshly-spawned note must always sound, even
-            // at extreme NPS (XSynth's steal semantics).
-            groups.sort_by_key(|&(spawn, vel, _, _)| (spawn, vel));
-            let fade_slots = self.config.max_voices / FADE_SLOTS_FRACTION;
-            let mut fade_count = self.voices.iter().filter(|v| v.fade_out).count();
-            let mut freed = 0usize;
-            for (_, _, _, positions) in &groups {
-                if freed >= over {
-                    break;
-                }
-                for &i in positions {
-                    let v = &mut self.voices[i];
-                    if v.release_at == u64::MAX {
-                        if fade_count < fade_slots {
-                            // Fade out instead of hard-killing: a hard kill
-                            // makes a sounding voice vanish in one block,
-                            // an audible click/crackle. A 1 ms linear fade
-                            // (XSynth's `ReleaseType::Kill`) keeps the
-                            // output continuous and the voice ends right
-                            // after, so the pool does not accumulate tails.
-                            v.release_at = self.global_frame;
-                            v.released = true;
-                            v.fade_out = true;
-                            fade_count += 1;
+                // Oldest first: a freshly-spawned note must always sound, even
+                // at extreme NPS (XSynth's steal semantics).
+                groups.sort_by_key(|&(spawn, vel, _, _)| (spawn, vel));
+                let fade_slots = self.config.max_voices / FADE_SLOTS_FRACTION;
+                let mut fade_count = self.voices.iter().filter(|v| v.fade_out).count();
+                let mut freed = 0usize;
+                for (_, _, _, positions) in &groups {
+                    if freed >= over {
+                        break;
+                    }
+                    for &i in positions {
+                        let v = &mut self.voices[i];
+                        if v.release_at == u64::MAX {
+                            if fade_count < fade_slots {
+                                // Fade out instead of hard-killing: a hard kill
+                                // makes a sounding voice vanish in one block,
+                                // an audible click/crackle. A 1 ms linear fade
+                                // (XSynth's `ReleaseType::Kill`) keeps the
+                                // output continuous and the voice ends right
+                                // after, so the pool does not accumulate tails.
+                                v.release_at = self.global_frame;
+                                v.released = true;
+                                v.fade_out = true;
+                                fade_count += 1;
+                            } else {
+                                // The fade slots are full (sustained overload):
+                                // end the voice now. It is the OLDEST survivor
+                                // (the sort above), so its output is already
+                                // decaying - inaudible.
+                                v.state.ended = 1;
+                            }
                         } else {
-                            // The fade slots are full (sustained overload):
-                            // end the voice now. It is the OLDEST survivor
-                            // (the sort above), so its output is already
-                            // decaying - inaudible.
+                            // Already fading: end it now (output has decayed).
                             v.state.ended = 1;
                         }
-                    } else {
-                        // Already fading: end it now (output has decayed).
-                        v.state.ended = 1;
+                        freed += 1;
                     }
-                    freed += 1;
                 }
-            }
-            // NOTE: no retain here - the released voices stay in the pool
-            // until their release envelope ends (then the GPU marks them
-            // `ended` and the next block's readback prunes them).
+                // NOTE: no retain here - the released voices stay in the pool
+                // until their release envelope ends (then the GPU marks them
+                // `ended` and the next block's readback prunes them).
             }
         }
 
@@ -2249,7 +2563,13 @@ impl GpuSynth {
         let env_counts: Vec<u32> = self
             .voices
             .iter()
-            .map(|v| if v.fade_out { 1 } else { v.env_stages.len() as u32 })
+            .map(|v| {
+                if v.fade_out {
+                    1
+                } else {
+                    v.env_stages.len() as u32
+                }
+            })
             .collect();
         let mut env_bases: Vec<u32> = Vec::with_capacity(n);
         let mut total_env: usize = 0;
@@ -2267,7 +2587,9 @@ impl GpuSynth {
         let prev_ids = self.prev_voice_ids.clone();
         let new_ids: Vec<u32> = self.voices.iter().map(|v| v.id).collect();
         let last_states = self.last_states.clone();
-        let st_count = last_states.as_ref().map_or(0, |st| st.len() / VoiceState::SIZE);
+        let st_count = last_states
+            .as_ref()
+            .map_or(0, |st| st.len() / VoiceState::SIZE);
         let base_frame = base;
         let interp = self.config.interpolation;
         let sr = self.config.sample_rate;
@@ -2331,9 +2653,8 @@ impl GpuSynth {
                                     let v = &voices_ref[i];
                                     let (off, off_r) = sample_offs_ref[i];
                                     let env_base = env_bases_ref[i];
-                                    let mut p = v.gpu_params(
-                                        off, off_r, env_base, base_frame, interp,
-                                    );
+                                    let mut p =
+                                        v.gpu_params(off, off_r, env_base, base_frame, interp);
                                     if v.fade_out {
                                         p.env_count = 1;
                                         p.release_idx = 0;
@@ -2412,8 +2733,7 @@ impl GpuSynth {
                 v.sample_offset_r = sample_offset_r;
                 let env_base = env_bases[i];
                 let env_count = env_counts[i];
-                let slice = &mut env_stages
-                    [env_base as usize..(env_base + env_count) as usize];
+                let slice = &mut env_stages[env_base as usize..(env_base + env_count) as usize];
                 if v.fade_out {
                     slice[0] = EnvStageGpu {
                         kind: 0,
@@ -2429,13 +2749,8 @@ impl GpuSynth {
                         };
                     }
                 }
-                let mut gp = v.gpu_params(
-                    sample_offset,
-                    sample_offset_r,
-                    env_base,
-                    base_frame,
-                    interp,
-                );
+                let mut gp =
+                    v.gpu_params(sample_offset, sample_offset_r, env_base, base_frame, interp);
                 if v.fade_out {
                     gp.env_count = 1;
                     gp.release_idx = 0;
@@ -2446,7 +2761,9 @@ impl GpuSynth {
                     k += 1;
                 }
                 let resumed = match last_states.as_ref() {
-                    Some(st) if k < prev_ids_ref.len() && prev_ids_ref[k] == v.id && k < st_count => {
+                    Some(st)
+                        if k < prev_ids_ref.len() && prev_ids_ref[k] == v.id && k < st_count =>
+                    {
                         let off = k * VoiceState::SIZE;
                         Some(*bytemuck::from_bytes::<VoiceState>(
                             &st[off..off + VoiceState::SIZE],
@@ -2818,8 +3135,7 @@ impl GpuSynth {
         // a file truly needs >500k simultaneous voices.
         if (voices as u64) * (block as u64) * 8 > MAX_VOICE_OUT_BYTES {
             if self.config.max_voices == 0 {
-                let max_batch =
-                    (MAX_VOICE_OUT_BYTES / (block as u64 * 8)) as u32;
+                let max_batch = (MAX_VOICE_OUT_BYTES / (block as u64 * 8)) as u32;
                 eprintln!(
                     "[warn] voices {voices} * block {block} exceeds device buffer ({} bytes), capping to {max_batch} (oldest trimmed)",
                     MAX_VOICE_OUT_BYTES
@@ -3357,7 +3673,7 @@ impl ProgressBar {
 }
 #[cfg(test)]
 mod tests {
-    use super::{limit_block, ChannelState, ParamSel};
+    use super::{ChannelState, ParamSel, limit_block};
 
     const LOOKAHEAD: usize = 256;
 
@@ -3378,7 +3694,10 @@ mod tests {
         // window (centred on the emitted sample) must attenuate it. soft_knee
         // caps the output at 1.0, so a surviving spike would blow past that.
         let max_abs = out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-        assert!(max_abs < 1.0, "single-sample spike not limited (max abs = {max_abs})");
+        assert!(
+            max_abs < 1.0,
+            "single-sample spike not limited (max abs = {max_abs})"
+        );
     }
 
     #[test]
@@ -3399,7 +3718,10 @@ mod tests {
 
         for (name, b) in [("block0", &block0), ("block1", &block1)] {
             let max_abs = b.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-            assert!(max_abs < 1.0, "{name}: end-of-block spike not limited (max abs = {max_abs})");
+            assert!(
+                max_abs < 1.0,
+                "{name}: end-of-block spike not limited (max abs = {max_abs})"
+            );
         }
     }
 
@@ -3417,7 +3739,10 @@ mod tests {
         assert!(out[50 * 2].is_finite(), "NaN was not sanitized");
         assert!(out[50 * 2 + 1].is_finite(), "Inf was not sanitized");
         let max_abs = out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-        assert!(max_abs < 1.0, "non-finite artifact leaked a pop (max abs = {max_abs})");
+        assert!(
+            max_abs < 1.0,
+            "non-finite artifact leaked a pop (max abs = {max_abs})"
+        );
     }
 
     #[test]
@@ -3458,7 +3783,10 @@ mod tests {
     #[test]
     fn rpn_default_sensitivity_is_2() {
         let st = ChannelState::new();
-        assert!((st.bend_sensitivity - 2.0).abs() < 1e-3, "default sensitivity must be 2 semitones (GM)");
+        assert!(
+            (st.bend_sensitivity - 2.0).abs() < 1e-3,
+            "default sensitivity must be 2 semitones (GM)"
+        );
     }
 
     #[test]

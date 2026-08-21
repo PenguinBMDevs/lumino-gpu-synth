@@ -149,8 +149,8 @@ impl Default for SynthConfig {
     fn default() -> Self {
         Self {
             sample_rate: 64_000,
-            max_voices: 0, // 0 = unlimited (black-MIDI mode) — was 4096, but 4096 caps at ~6144 pool (~3000 reported)
-            max_voices_per_key: 3, // 3 keeps black MIDI under 100ms/block on RTX 2060 (4→33k 103ms, 3→25k 85ms); set 0 for truly unlimited per-key
+            max_voices: 0,         // 0 = unlimited — black MIDI must never drop a voice
+            max_voices_per_key: 4, // 4 per (ch,key) as requested
             block_size: 512,
             interpolation: InterpolationMode::Linear,
             use_effects: true,

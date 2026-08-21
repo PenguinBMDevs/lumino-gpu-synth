@@ -1,8 +1,10 @@
 //! MIDI event types shared by the parser, the scheduler and the engine.
 
 pub mod parser;
+pub mod stream;
 
 pub use parser::MidiFile;
+pub use stream::MidiStream;
 
 /// A MIDI event as understood by the synthesizer (channel-scoped).
 #[derive(Debug, Clone, Copy, PartialEq)]

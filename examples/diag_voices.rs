@@ -40,7 +40,11 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
     let config = SynthConfig {
         block_size,
         max_voices,
-        sample_rate: if sample_rate > 0 { sample_rate } else { SynthConfig::default().sample_rate },
+        sample_rate: if sample_rate > 0 {
+            sample_rate
+        } else {
+            SynthConfig::default().sample_rate
+        },
         ..SynthConfig::default()
     };
     let chs = match config.channels {

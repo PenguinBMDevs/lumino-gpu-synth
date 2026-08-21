@@ -1,11 +1,16 @@
-//! Renders a MIDI with `assets/test.sf2` on the GPU and writes the result to
-//! `render-output.wav` (32-bit float, 64 kHz stereo).
+//! Streaming offline render — zero MIDI event Vec, zero full-sample Vec.
+//!
+//! The MIDI file is never loaded as a `Vec<TimedEvent>` (heap-merged
+//! `MidiStream` yields one event at a time) and audio is flushed
+//! block-by-block through `WavStreamWriter`. Peak memory is
+//! `O(tracks + block)` instead of `O(events + samples)`.
 //!
 //! Usage:
 //! ```text
-//! cargo run --release --example render_example -- [midi] [seconds]
+//! cargo run --release --example render_example -- [midi] [seconds] [wav_out]
 //! ```
 //! `seconds` limits the render to the first N seconds (0 = whole file).
+//! `wav_out` defaults to `render-output.wav`.
 
 use lumino_gpu_synth::{GpuSynth, SynthConfig};
 
@@ -19,6 +24,10 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
         .get(2)
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
+    let wav_path = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(|| "render-output.wav".to_string());
 
     let config = SynthConfig {
         block_size: std::env::var("LUMINO_BLOCK")
@@ -42,11 +51,12 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
         ..SynthConfig::default()
     };
     println!(
-        "initializing GPU synth: {} Hz, {} voices, block {}",
+        "initializing GPU synth: {} Hz, {} voices, block {} — streaming mode",
         config.sample_rate, config.max_voices, config.block_size
     );
+    println!("midi: {midi_path} -> wav: {wav_path} (streaming, no MIDI Vec)");
 
-    let mut synth = GpuSynth::new(config)?;
+    let mut synth = GpuSynth::new(config.clone())?;
     println!("adapter: {}", synth.adapter_info().name);
 
     let t_sf = std::time::Instant::now();
@@ -58,29 +68,25 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
 
     let start = std::time::Instant::now();
     let result = if max_seconds > 0.0 {
-        let frames = (max_seconds * 64_000.0) as u64;
-        println!("rendering first {frames} frames ({max_seconds}s)...");
-        synth.render_midi_frames(&midi_path, frames)?
+        let frames = (max_seconds * config.sample_rate as f64) as u64;
+        println!("streaming first {frames} frames ({max_seconds}s) ...");
+        synth.render_midi_to_wav_streaming(&midi_path, &wav_path, Some(frames))?
     } else {
-        println!("rendering whole file...");
-        synth.render_midi_file(&midi_path)?
+        println!(
+            "streaming whole file ... (MidiStream heap-merge, WavStreamWriter flush per block)"
+        );
+        synth.render_midi_file_to_wav_streaming(&midi_path, &wav_path)?
     };
     let elapsed = start.elapsed();
 
     println!(
-        "rendered {} frames ({} s) in {:.2?} -> {:.2}x realtime",
+        "streamed {} frames ({} s) in {:.2?} -> {:.2}x realtime",
         result.frames,
         result.frames as f64 / result.sample_rate as f64,
         elapsed,
         result.frames as f64 / (elapsed.as_secs_f64() * result.sample_rate as f64)
     );
-
-    lumino_gpu_synth::audio::wav::write_f32_wav(
-        "render-output.wav",
-        &result.samples,
-        result.sample_rate,
-    )?;
-    println!("wrote render-output.wav");
+    println!("wrote {wav_path} (streaming, peak O(block) not O(samples))");
 
     Ok(())
 }

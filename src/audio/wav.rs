@@ -171,6 +171,99 @@ pub fn write_f32_wav_channels(
     Ok(())
 }
 
+/// Incremental WAV writer — streams blocks to disk without holding the
+/// whole render in memory. Writes a placeholder header on `create` and patches
+/// it on `finalize`.
+///
+/// # Example
+/// ```no_run
+/// use lumino_gpu_synth::audio::wav::WavStreamWriter;
+/// let mut w = WavStreamWriter::create("out.wav", 64_000, 2).unwrap();
+/// w.write_samples(&[0.0; 1024]).unwrap();
+/// w.finalize().unwrap();
+/// ```
+pub struct WavStreamWriter {
+    file: std::io::BufWriter<std::fs::File>,
+    sample_rate: u32,
+    channels: u16,
+    frames_written: u64,
+}
+
+impl WavStreamWriter {
+    /// Creates `path` and writes a placeholder 32-bit float WAV header.
+    pub fn create(
+        path: impl AsRef<std::path::Path>,
+        sample_rate: u32,
+        channels: u16,
+    ) -> Result<Self, crate::SynthError> {
+        let file = std::fs::File::create(path.as_ref())?;
+        let mut w = std::io::BufWriter::new(file);
+        // RIFF header with placeholder sizes (patched in finalize)
+        w.write_all(b"RIFF")?;
+        w.write_all(&0u32.to_le_bytes())?; // file size - 8
+        w.write_all(b"WAVE")?;
+        w.write_all(b"fmt ")?;
+        w.write_all(&16u32.to_le_bytes())?;
+        w.write_all(&3u16.to_le_bytes())?; // IEEE float
+        w.write_all(&channels.to_le_bytes())?;
+        w.write_all(&sample_rate.to_le_bytes())?;
+        w.write_all(&(sample_rate * channels as u32 * 4).to_le_bytes())?;
+        w.write_all(&(channels * 4).to_le_bytes())?;
+        w.write_all(&32u16.to_le_bytes())?;
+        w.write_all(b"data")?;
+        w.write_all(&0u32.to_le_bytes())?; // data size
+        w.flush()?;
+        Ok(Self {
+            file: w,
+            sample_rate,
+            channels,
+            frames_written: 0,
+        })
+    }
+
+    /// Appends interleaved `samples` (length must be a multiple of `channels`).
+    pub fn write_samples(&mut self, samples: &[f32]) -> Result<(), crate::SynthError> {
+        debug_assert!(samples.len() % self.channels as usize == 0);
+        for s in samples {
+            self.file.write_all(&s.to_le_bytes())?;
+        }
+        self.frames_written += (samples.len() as u64) / self.channels as u64;
+        Ok(())
+    }
+
+    /// Number of frames written so far.
+    pub fn frames_written(&self) -> u64 {
+        self.frames_written
+    }
+
+    /// Finalizes the file by patching the RIFF/data sizes.
+    pub fn finalize(mut self) -> Result<(), crate::SynthError> {
+        self.file.flush()?;
+        let data_bytes = self.frames_written * self.channels as u64 * 4;
+        let file_bytes = 36 + data_bytes;
+        let mut file = self
+            .file
+            .into_inner()
+            .map_err(|e| crate::SynthError::Io(e.into_error()))?;
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(4))?;
+        file.write_all(&(file_bytes as u32).to_le_bytes())?;
+        file.seek(SeekFrom::Start(40))?;
+        file.write_all(&(data_bytes as u32).to_le_bytes())?;
+        file.flush()?;
+        Ok(())
+    }
+
+    /// Sample rate.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+    /// Channels.
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+}
+
 /// Writes interleaved float samples as 16-bit PCM WAV.
 ///
 /// # Errors
