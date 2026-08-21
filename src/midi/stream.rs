@@ -303,6 +303,36 @@ impl MidiStream {
     pub fn next(&mut self) -> Option<TimedEvent> {
         self.next_event()
     }
+
+    /// Iterates every note-on in track order (not sample order) without
+    /// touching the heap. Used for pre-warming sample caches: the set of
+    /// wanted samples is order-independent, so a raw track scan is O(n)
+    /// instead of O(n log tracks) heap pops.
+    pub fn for_each_note_on<F>(&self, mut f: F)
+    where
+        F: FnMut(u8, u8),
+    {
+        for track in &self.tracks {
+            for ev in track {
+                if let TrackEventKind::Midi { message, .. } = &ev.kind {
+                    if let MidiMessage::NoteOn { key, vel } = message {
+                        let vel = vel.as_int();
+                        if vel > 1 {
+                            f(*key, vel);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Faster wanted-sample collection without heap: returns the raw note-on
+    /// keys/vels in track order. Caller can map through `zones_at`.
+    pub fn collect_note_ons(&self) -> Vec<(u8, u8)> {
+        let mut out = Vec::new();
+        self.for_each_note_on(|k, v| out.push((k, v)));
+        out
+    }
 }
 
 fn midi_to_packed(msg: &MidiMessage) -> Option<(u32, u32)> {

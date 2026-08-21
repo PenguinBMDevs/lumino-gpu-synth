@@ -1602,26 +1602,21 @@ impl GpuSynth {
         let t0 = std::time::Instant::now();
         let mut stream = MidiStream::open(midi_path.as_ref(), self.config.sample_rate)?;
         let t1 = std::time::Instant::now();
-        // Pre-warm: scan once to collect wanted samples and upload them in
-        // parallel, exactly like `render_midi_inner`. Streaming without this
-        // produced 299 sample diffs at 0.47s on right-example.mid (512 block)
-        // due to lazy per-block sample uploads racing the pipeline.
-        // We scan the already-opened `stream` and then `rewind` it, so the
-        // file is parsed only once (the old double-open cost 800 MB extra I/O
-        // on black MIDI).
+        // Pre-warm: collect wanted samples via raw track scan (O(n), no heap)
+        // — same set as `render_midi_inner` but without consuming the stream,
+        // so no `rewind` needed. The old heap-scan produced 299 sample diffs
+        // when skipped (lazy per-block uploads race the pipeline).
         if self.sf.is_some() {
             let mut wanted: Vec<usize> = Vec::new();
             {
                 let sf_ref = self.sf.as_ref().expect("soundfont present");
-                while let Some(ev) = stream.next_event() {
-                    if let crate::midi::MidiEvent::NoteOn { key, vel } = ev.event() {
-                        for &zid in sf_ref.zones_at(key, vel) {
-                            let z = sf_ref.zone(zid);
-                            wanted.push(z.sample_id);
-                            wanted.push(z.sample_id_r);
-                        }
+                stream.for_each_note_on(|key, vel| {
+                    for &zid in sf_ref.zones_at(key, vel) {
+                        let z = sf_ref.zone(zid);
+                        wanted.push(z.sample_id);
+                        wanted.push(z.sample_id_r);
                     }
-                }
+                });
                 wanted.sort_unstable();
                 wanted.dedup();
             }
@@ -1654,7 +1649,6 @@ impl GpuSynth {
                     self.render_bg_dirty = true;
                 }
             }
-            stream.rewind();
         }
 
         let events_end = stream.end_sample();

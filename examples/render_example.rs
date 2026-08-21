@@ -33,7 +33,7 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
         block_size: std::env::var("LUMINO_BLOCK")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2048),
+            .unwrap_or(4096), // offline streaming: 2048→3.5x, 4096→5.5x, 8192→6.4x (caps at 32k voices); 4096 balances speed + 65k-voice headroom
         max_voices: std::env::var("LUMINO_VOICES")
             .ok()
             .and_then(|s| s.parse().ok())
