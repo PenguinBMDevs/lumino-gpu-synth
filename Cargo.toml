@@ -16,6 +16,8 @@ pollster = "0.4"
 bytemuck = { version = "1.23", features = ["derive"] }
 thiserror = "2.0"
 rayon = "1.10"
+sysinfo = { version = "0.39.6", features = ["system"] }
+memmap2 = "0.9.11"
 
 [profile.release]
 opt-level = 3

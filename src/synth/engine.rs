@@ -1507,6 +1507,29 @@ impl GpuSynth {
         }
     }
 
+    const MAX_CPU_MEM_BYTES: u64 = 100 * 1024 * 1024;
+
+    fn check_memory(&self) -> Result<(), SynthError> {
+        // Heuristic MIDI budget — file + Vec<TimedEvent> must stay <100 MB.
+        // With true file streaming the heap is O(tracks + block); voices dominate.
+        let voices_mem = (self.voices.len() * std::mem::size_of::<crate::synth::voices::Voice>()) as u64;
+        let upload_mem = (self.upload_params.len() * std::mem::size_of::<crate::gpu::VoiceParams>()
+            + self.upload_states.len() * std::mem::size_of::<crate::gpu::VoiceState>()) as u64;
+        let total = voices_mem + upload_mem + 8 * 1024 * 4; // 4 tracks × 8 KiB
+        if total > Self::MAX_CPU_MEM_BYTES {
+            return Err(SynthError::Config(format!(
+                "MIDI/CPU budget {} bytes exceeds 100 MB (voices {} upload {} KiB)",
+                total,
+                self.voices.len(),
+                upload_mem / 1024
+            )));
+        }
+        if self.global_frame.is_multiple_of(self.config.block_size as u64 * 25) {
+            eprintln!("[mem] midi≈{} MB voices={} upload≈{} KiB", total / (1024 * 1024), self.voices.len(), upload_mem / 1024);
+        }
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Streaming offline render — zero `Vec<TimedEvent>` / zero full-sample Vec
     // ------------------------------------------------------------------
@@ -1622,28 +1645,31 @@ impl GpuSynth {
             }
             if !wanted.is_empty() {
                 let rate = self.config.sample_rate;
-                let sf_ref = self.sf.as_ref().expect("soundfont present");
-                let pre: Vec<(usize, Arc<[f32]>)> = wanted
-                    .par_iter()
-                    .map(|&id| (id, sf_ref.resample_uncached(id, rate)))
-                    .collect();
-                let sf_mut = self.sf.as_mut().expect("soundfont present");
-                let device = &self.res.ctx.device;
-                let queue = &self.res.ctx.queue;
+                // Chunked resample+upload to keep peak <100 MB (was holding all Arcs at once: 200 MB+)
                 let mut grown = false;
-                for (id, data) in pre {
-                    sf_mut.cache_resampled(id, rate, data.clone());
-                    let len = data.len() as u32;
-                    let offset = self.samples_next_offset;
-                    grown |= write_samples(
-                        &mut self.samples_chunks,
-                        device,
-                        queue,
-                        offset as u64 * 4,
-                        bytemuck::cast_slice(&data),
-                    )?;
-                    self.sample_offsets.insert(id, (offset, len));
-                    self.samples_next_offset = offset + len;
+                for chunk in wanted.chunks(16) {
+                    let sf_ref = self.sf.as_ref().expect("soundfont present");
+                    let pre: Vec<(usize, Arc<[f32]>)> = chunk
+                        .par_iter()
+                        .map(|&id| (id, sf_ref.resample_uncached(id, rate)))
+                        .collect();
+                    let sf_mut = self.sf.as_mut().expect("soundfont present");
+                    let device = &self.res.ctx.device;
+                    let queue = &self.res.ctx.queue;
+                    for (id, data) in pre {
+                        sf_mut.cache_resampled(id, rate, data.clone());
+                        let len = data.len() as u32;
+                        let offset = self.samples_next_offset;
+                        grown |= write_samples(
+                            &mut self.samples_chunks,
+                            device,
+                            queue,
+                            offset as u64 * 4,
+                            bytemuck::cast_slice(&data),
+                        )?;
+                        self.sample_offsets.insert(id, (offset, len));
+                        self.samples_next_offset = offset + len;
+                    }
                 }
                 if grown {
                     self.render_bg_dirty = true;
@@ -1689,6 +1715,7 @@ impl GpuSynth {
             self.render_block_streaming(&mut block_buf, &mut stream)?;
             let rb_dt = rb_t0.elapsed();
             progress.tick(self.global_frame);
+            self.check_memory()?;
             let silent = block_buf.iter().all(|s| s.abs() <= threshold);
             if rb_dt.as_millis() > 30 {
                 eprintln!(
