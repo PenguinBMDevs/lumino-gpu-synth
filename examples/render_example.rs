@@ -28,7 +28,7 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
         max_voices: std::env::var("LUMINO_VOICES")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(16_384),
+            .unwrap_or(SynthConfig::default().max_voices),
         show_progress: true,
         envelope_curves: if std::env::var("LUMINO_LERP_ENV").is_ok() {
             lumino_gpu_synth::synth::dsp::EnvelopeCurveConfig {

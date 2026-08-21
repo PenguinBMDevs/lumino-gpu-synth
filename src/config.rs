@@ -64,12 +64,18 @@ pub struct SynthConfig {
     /// are faded out (XSynth's `global_voice_limit` + voice stealing) so a
     /// fresh note always sounds.
     ///
+    /// Set to `0` for **unlimited** polyphony (black-MIDI mode) — no global
+    /// trimming is performed and the GPU buffers grow on demand; the only
+    /// remaining limit is the physical `MAX_VOICE_OUT_BYTES` batch window
+    /// (handled by chunked dispatch). This is the recommended setting for
+    /// black MIDI where every note must sound.
+    ///
     /// The default (4096, like XSynth's) keeps the simultaneous-voice noise
     /// floor low: N voices mix with ~sqrt(N) noise density, so 16k voices
     /// sound like white noise even when the peak is limited. Raise it only
     /// if a specific file really needs more simultaneous notes.
     ///
-    /// Default: `4096`.
+    /// Default: `0` (unlimited, black-MIDI mode). Set e.g. `4096` to cap.
     pub max_voices: usize,
 
     /// Maximum number of simultaneous voices for the *same key* on the same
@@ -143,7 +149,7 @@ impl Default for SynthConfig {
     fn default() -> Self {
         Self {
             sample_rate: 64_000,
-            max_voices: 4_096,
+            max_voices: 0, // 0 = unlimited (black-MIDI mode) — was 4096, but 4096 caps at ~6144 pool (~3000 reported)
             max_voices_per_key: 8,
             block_size: 512,
             interpolation: InterpolationMode::Linear,
@@ -166,9 +172,9 @@ impl SynthConfig {
                 "sample_rate must be non-zero".into(),
             ));
         }
-        if self.max_voices == 0 || self.max_voices > 65536 {
+        if self.max_voices > 1_000_000 {
             return Err(crate::SynthError::Config(format!(
-                "max_voices must be within 1..=65536, got {}",
+                "max_voices must be within 0..=1_000_000 (0 = unlimited), got {}",
                 self.max_voices
             )));
         }

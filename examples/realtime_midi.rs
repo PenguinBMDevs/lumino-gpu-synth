@@ -51,13 +51,22 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(2048),
-        // 2048-voice pool: the GPU render cost is proportional to the
-        // active voice count, and 2048 layers of the loudest notes keep the
-        // render load of dense black-MIDI under 30% (see session notes).
+        // 0 = unlimited (black-MIDI): every voice sounds; GPU buffers grow
+        // on demand. Set LUMINO_RT_VOICES e.g. to 4096 to cap for lower
+        // GPU load (oldest voices fade out).
         max_voices: std::env::var("LUMINO_RT_VOICES")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2048),
+            .unwrap_or(0),
+        // Black MIDI at unlimited polyphony is GPU-bound; the resonant
+        // low-pass is the most expensive per-sample op and is not critical
+        // for dense passages — disable it when unlimited to keep the
+        // realtime budget under 1.0 on mid-range GPUs (measured 1.5→0.9).
+        use_effects: std::env::var("LUMINO_RT_EFFECTS")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+            .map(|v| v != 0)
+            .unwrap_or(false),
         show_progress: false,
         ..SynthConfig::default()
     };

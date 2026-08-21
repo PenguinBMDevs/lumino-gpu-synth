@@ -33,12 +33,14 @@ fn main() -> Result<(), lumino_gpu_synth::SynthError> {
         .get(1)
         .cloned()
         .unwrap_or_else(|| "assets/test.mid".to_string());
-    let max_voices: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2048);
+    let max_voices: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
     let block_size: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2048);
+    let sample_rate: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let config = SynthConfig {
         block_size,
         max_voices,
+        sample_rate: if sample_rate > 0 { sample_rate } else { SynthConfig::default().sample_rate },
         ..SynthConfig::default()
     };
     let chs = match config.channels {

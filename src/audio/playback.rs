@@ -28,6 +28,9 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+/// DIAG: throttle for the `[UNDERRUN]` stderr marker below.
+static LAST_UD_LOG: AtomicI64 = AtomicI64::new(0);
+
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use super::resample::SincResampler;
@@ -230,6 +233,19 @@ impl AudioPlayback {
                                     // Underrun: silence the remainder.
                                     data[i..].fill(0.0);
                                     cb_stats.underruns.fetch_add(1, Ordering::Relaxed);
+                                    // DIAG: surface underruns to stderr (the
+                                    // `\r` status line is easy to miss).
+                                    let ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as i64;
+                                    let prev = LAST_UD_LOG.fetch_max(ms, Ordering::Relaxed);
+                                    if ms - prev > 500 {
+                                        eprintln!(
+                                            "[UNDERRUN] queue empty (total: {})",
+                                            cb_stats.underruns.load(Ordering::Relaxed)
+                                        );
+                                    }
                                     break;
                                 }
                             }

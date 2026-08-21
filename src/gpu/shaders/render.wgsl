@@ -243,10 +243,9 @@ fn advance_frame(p: VoiceParams, st: VoiceState, env_value: f32, frame: u32) -> 
     // "render until silent" semantics and keeps long-release soundfonts
     // from accumulating thousands of inaudible tail voices. The output
     // below the threshold is indistinguishable from the reference.
-    // TEMP DEBUG: disabled to test whether it wrongly cuts voices early
-    // if (s.is_released != 0u && ev < 0.0001) {
-    //     s.ended = 1u;
-    // }
+    if (s.is_released != 0u && ev < 0.0002) {
+        s.ended = 1u;
+    }
 
     // --- advance position ---
     var carry: u32 = 0u;
